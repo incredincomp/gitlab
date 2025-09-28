@@ -1,0 +1,300 @@
+#!/bin/bash
+# GitLab Prometheus Metrics Exporter
+# Collects comprehensive GitLab metrics for monitoring systems
+
+set -euo pipefail
+
+# Configuration
+METRICS_FILE="/tmp/gitlab_metrics.prom"
+METRICS_PORT="9168"
+LOG_FILE="/var/log/gitlab-metrics.log"
+
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Get GitLab service metrics
+get_service_metrics() {
+    local services=("postgresql" "redis" "nginx" "unicorn" "sidekiq" "gitaly")
+    
+    for service in "${services[@]}"; do
+        if gitlab-ctl status "$service" | grep -q "run:"; then
+            echo "gitlab_service_up{service=\"$service\"} 1" >> "$METRICS_FILE"
+            
+            # Get process PID and resource usage
+            local pid
+            pid=$(gitlab-ctl status "$service" | awk '/pid/ {print $4}' | tr -d ';' 2>/dev/null || echo "0")
+            if [[ "$pid" -gt 0 ]]; then
+                # Memory usage in MB
+                local mem_kb
+                mem_kb=$(ps -p "$pid" -o rss= 2>/dev/null || echo "0")
+                local mem_mb=$((mem_kb / 1024))
+                echo "gitlab_service_memory_mb{service=\"$service\"} $mem_mb" >> "$METRICS_FILE"
+                
+                # CPU usage percentage
+                local cpu_pct
+                cpu_pct=$(ps -p "$pid" -o pcpu= 2>/dev/null | tr -d ' ' || echo "0")
+                echo "gitlab_service_cpu_percent{service=\"$service\"} $cpu_pct" >> "$METRICS_FILE"
+            fi
+        else
+            echo "gitlab_service_up{service=\"$service\"} 0" >> "$METRICS_FILE"
+        fi
+    done
+}
+
+# Get database metrics
+get_database_metrics() {
+    if gitlab-psql -c "SELECT 1;" >/dev/null 2>&1; then
+        echo "gitlab_database_up 1" >> "$METRICS_FILE"
+        
+        # Database size
+        local db_size
+        db_size=$(gitlab-psql -t -c "SELECT pg_database_size(current_database());" 2>/dev/null | tr -d ' ' || echo "0")
+        echo "gitlab_database_size_bytes $db_size" >> "$METRICS_FILE"
+        
+        # Connection count
+        local connections
+        connections=$(gitlab-psql -t -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | tr -d ' ' || echo "0")
+        echo "gitlab_database_connections $connections" >> "$METRICS_FILE"
+        
+        # Database version
+        local db_version
+        db_version=$(gitlab-psql -t -c "SHOW server_version_num;" 2>/dev/null | tr -d ' ' || echo "0")
+        echo "gitlab_database_version $db_version" >> "$METRICS_FILE"
+        
+        # Table count
+        local table_count
+        table_count=$(gitlab-psql -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+        echo "gitlab_database_tables $table_count" >> "$METRICS_FILE"
+    else
+        echo "gitlab_database_up 0" >> "$METRICS_FILE"
+    fi
+}
+
+# Get Redis metrics
+get_redis_metrics() {
+    if gitlab-redis-cli ping | grep -q "PONG"; then
+        echo "gitlab_redis_up 1" >> "$METRICS_FILE"
+        
+        # Redis memory usage
+        local redis_memory
+        redis_memory=$(gitlab-redis-cli info memory | grep "used_memory:" | cut -d: -f2 | tr -d '\r' || echo "0")
+        echo "gitlab_redis_memory_bytes $redis_memory" >> "$METRICS_FILE"
+        
+        # Redis connected clients
+        local redis_clients
+        redis_clients=$(gitlab-redis-cli info clients | grep "connected_clients:" | cut -d: -f2 | tr -d '\r' || echo "0")
+        echo "gitlab_redis_clients $redis_clients" >> "$METRICS_FILE"
+        
+        # Redis keyspace
+        local redis_keys
+        redis_keys=$(gitlab-redis-cli info keyspace | grep "keys=" | cut -d= -f2 | cut -d, -f1 || echo "0")
+        echo "gitlab_redis_keys $redis_keys" >> "$METRICS_FILE"
+    else
+        echo "gitlab_redis_up 0" >> "$METRICS_FILE"
+    fi
+}
+
+# Get system metrics
+get_system_metrics() {
+    # System uptime
+    local uptime
+    uptime=$(awk '{print int($1)}' /proc/uptime)
+    echo "gitlab_system_uptime_seconds $uptime" >> "$METRICS_FILE"
+    
+    # Memory usage
+    local mem_total mem_available mem_used
+    mem_total=$(grep "MemTotal:" /proc/meminfo | awk '{print $2 * 1024}')
+    mem_available=$(grep "MemAvailable:" /proc/meminfo | awk '{print $2 * 1024}')
+    mem_used=$((mem_total - mem_available))
+    
+    echo "gitlab_system_memory_total_bytes $mem_total" >> "$METRICS_FILE"
+    echo "gitlab_system_memory_used_bytes $mem_used" >> "$METRICS_FILE"
+    echo "gitlab_system_memory_available_bytes $mem_available" >> "$METRICS_FILE"
+    
+    # Disk usage for important paths
+    local paths=("/" "/var/opt/gitlab" "/var/log/gitlab")
+    for path in "${paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            local disk_total disk_used disk_available
+            read -r disk_total disk_used disk_available < <(df -B1 "$path" | awk 'NR==2 {print $2, $3, $4}')
+            
+            local path_label
+            path_label=$(echo "$path" | sed 's|/|_|g' | sed 's|^_||')
+            [[ -z "$path_label" ]] && path_label="root"
+            
+            echo "gitlab_disk_total_bytes{mount=\"$path\"} $disk_total" >> "$METRICS_FILE"
+            echo "gitlab_disk_used_bytes{mount=\"$path\"} $disk_used" >> "$METRICS_FILE"
+            echo "gitlab_disk_available_bytes{mount=\"$path\"} $disk_available" >> "$METRICS_FILE"
+        fi
+    done
+    
+    # Load average
+    local load1 load5 load15
+    read -r load1 load5 load15 < /proc/loadavg
+    echo "gitlab_system_load1 $load1" >> "$METRICS_FILE"
+    echo "gitlab_system_load5 $load5" >> "$METRICS_FILE"
+    echo "gitlab_system_load15 $load15" >> "$METRICS_FILE"
+}
+
+# Get GitLab application metrics via Rails console
+get_application_metrics() {
+    # User count
+    local users
+    users=$(timeout 30 gitlab-rails runner "puts User.count" 2>/dev/null || echo "0")
+    echo "gitlab_users_total $users" >> "$METRICS_FILE"
+    
+    # Project count
+    local projects
+    projects=$(timeout 30 gitlab-rails runner "puts Project.count" 2>/dev/null || echo "0")
+    echo "gitlab_projects_total $projects" >> "$METRICS_FILE"
+    
+    # Repository size (approximate)
+    if [[ -d "/var/opt/gitlab/git-data/repositories" ]]; then
+        local repo_size
+        repo_size=$(du -sb /var/opt/gitlab/git-data/repositories 2>/dev/null | awk '{print $1}' || echo "0")
+        echo "gitlab_repositories_size_bytes $repo_size" >> "$METRICS_FILE"
+    fi
+    
+    # Issues count
+    local issues
+    issues=$(timeout 30 gitlab-rails runner "puts Issue.count" 2>/dev/null || echo "0")
+    echo "gitlab_issues_total $issues" >> "$METRICS_FILE"
+    
+    # Merge requests count
+    local merge_requests
+    merge_requests=$(timeout 30 gitlab-rails runner "puts MergeRequest.count" 2>/dev/null || echo "0")
+    echo "gitlab_merge_requests_total $merge_requests" >> "$METRICS_FILE"
+}
+
+# Get HTTP response metrics
+get_http_metrics() {
+    local external_url
+    external_url=$(grep "^external_url" /etc/gitlab/gitlab.rb | cut -d"'" -f2 2>/dev/null || echo "http://localhost")
+    local check_url
+    check_url=$(echo "$external_url" | sed 's/https\?:\/\/[^\/]*/http:\/\/localhost/')
+    
+    # Test response time and availability
+    local start_time end_time response_time http_code
+    start_time=$(date +%s%N)
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$check_url/users/sign_in" 2>/dev/null || echo "000")
+    end_time=$(date +%s%N)
+    response_time=$(( (end_time - start_time) / 1000000 )) # Convert to milliseconds
+    
+    echo "gitlab_http_response_time_ms $response_time" >> "$METRICS_FILE"
+    echo "gitlab_http_response_code $http_code" >> "$METRICS_FILE"
+    
+    if [[ "$http_code" == "200" ]]; then
+        echo "gitlab_http_up 1" >> "$METRICS_FILE"
+    else
+        echo "gitlab_http_up 0" >> "$METRICS_FILE"
+    fi
+}
+
+# Get backup metrics
+get_backup_metrics() {
+    local backup_dir="/var/opt/gitlab/backups"
+    if [[ -d "$backup_dir" ]]; then
+        # Count backup files
+        local backup_count
+        backup_count=$(find "$backup_dir" -name "*_gitlab_backup.tar" -type f | wc -l)
+        echo "gitlab_backups_total $backup_count" >> "$METRICS_FILE"
+        
+        # Get latest backup info
+        local latest_backup
+        latest_backup=$(find "$backup_dir" -name "*_gitlab_backup.tar" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2- 2>/dev/null)
+        if [[ -n "$latest_backup" ]]; then
+            local backup_age backup_size
+            backup_age=$(( $(date +%s) - $(stat -c%Y "$latest_backup") ))
+            backup_size=$(stat -c%s "$latest_backup")
+            
+            echo "gitlab_backup_age_seconds $backup_age" >> "$METRICS_FILE"
+            echo "gitlab_backup_size_bytes $backup_size" >> "$METRICS_FILE"
+        else
+            echo "gitlab_backup_age_seconds -1" >> "$METRICS_FILE"
+            echo "gitlab_backup_size_bytes 0" >> "$METRICS_FILE"
+        fi
+    else
+        echo "gitlab_backups_total 0" >> "$METRICS_FILE"
+        echo "gitlab_backup_age_seconds -1" >> "$METRICS_FILE"
+        echo "gitlab_backup_size_bytes 0" >> "$METRICS_FILE"
+    fi
+}
+
+# Generate all metrics
+generate_metrics() {
+    # Clear metrics file
+    > "$METRICS_FILE"
+    
+    # Add header
+    echo "# GitLab Metrics" >> "$METRICS_FILE"
+    echo "# Generated at $(date)" >> "$METRICS_FILE"
+    echo "" >> "$METRICS_FILE"
+    
+    log "INFO: Collecting GitLab metrics"
+    
+    # Collect all metrics
+    get_service_metrics
+    get_database_metrics
+    get_redis_metrics
+    get_system_metrics
+    get_application_metrics
+    get_http_metrics
+    get_backup_metrics
+    
+    # Add timestamp
+    echo "gitlab_metrics_last_update $(date +%s)" >> "$METRICS_FILE"
+    
+    log "INFO: Metrics collection completed"
+}
+
+# Simple HTTP server to serve metrics
+serve_metrics() {
+    log "INFO: Starting metrics server on port $METRICS_PORT"
+    
+    while true; do
+        # Generate fresh metrics
+        generate_metrics
+        
+        # Serve metrics via netcat if available
+        if command -v nc >/dev/null; then
+            {
+                echo -e "HTTP/1.1 200 OK\r"
+                echo -e "Content-Type: text/plain\r"
+                echo -e "Content-Length: $(wc -c < "$METRICS_FILE")\r"
+                echo -e "\r"
+                cat "$METRICS_FILE"
+            } | nc -l -p "$METRICS_PORT" -q 1 2>/dev/null || true
+        fi
+        
+        # Wait before next collection
+        sleep 30
+    done
+}
+
+# Main function
+main() {
+    case "${1:-generate}" in
+        generate)
+            generate_metrics
+            cat "$METRICS_FILE"
+            ;;
+        serve)
+            serve_metrics
+            ;;
+        file)
+            generate_metrics
+            echo "Metrics written to: $METRICS_FILE"
+            ;;
+        *)
+            echo "Usage: $0 [generate|serve|file]"
+            echo "  generate  - Generate metrics and output to stdout (default)"
+            echo "  serve     - Start HTTP server on port $METRICS_PORT"
+            echo "  file      - Generate metrics and save to file"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

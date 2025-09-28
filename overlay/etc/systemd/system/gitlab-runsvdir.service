@@ -6,6 +6,15 @@ After=network-online.target
 ExecStart=/opt/gitlab/embedded/bin/runsvdir-start
 Restart=always
 TasksMax=4915
+# Resource limits for container optimization
+MemoryAccounting=true
+MemoryMax=4G
+CPUAccounting=true
+CPUQuota=200%
+# Ensure proper cleanup
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=300
 
 [Install]
 WantedBy=basic.target

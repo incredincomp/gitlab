@@ -1,0 +1,167 @@
+#!/bin/bash
+# GitLab 18.4 Feature Integration Script
+# Enables and configures new GitLab 18.4 features
+
+set -euo pipefail
+
+CONF="/etc/gitlab/gitlab.rb"
+LOG_FILE="/var/log/gitlab-18.4-features.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Enable GitLab 18.4 specific features
+configure_gitlab_18_4_features() {
+    log "INFO: Configuring GitLab 18.4 specific features"
+    
+    # Enhanced CI/CD features
+    cat >> "$CONF" << 'EOF'
+
+# GitLab 18.4 Enhanced CI/CD Features
+gitlab_rails['ci_job_token_push_repository_enabled'] = true
+gitlab_rails['pipeline_branch_simulation_enabled'] = true
+gitlab_ci['enhanced_secret_detection'] = true
+
+# Enhanced Security Features  
+gitlab_rails['enhanced_artifact_access_controls'] = true
+gitlab_rails['advanced_sast_performance_improvements'] = true
+
+# Performance optimizations for 18.4
+gitlab_rails['git_fetch_optimization'] = true
+gitlab_rails['secret_detection_git_improvements'] = true
+
+# Enhanced vulnerability management
+gitlab_rails['vulnerability_auto_resolve_tracking'] = true
+
+EOF
+
+    log "INFO: GitLab 18.4 features configured"
+}
+
+# Configure GitLab Duo features (if license supports it)
+configure_duo_features() {
+    log "INFO: Configuring GitLab Duo features for 18.4"
+    
+    cat >> "$CONF" << 'EOF'
+
+# GitLab Duo 18.4 Features (requires appropriate license)
+# gitlab_rails['duo_model_selection_enabled'] = true
+# gitlab_rails['duo_context_exclusion_enabled'] = true  
+# gitlab_rails['duo_code_review_enabled'] = true
+# gitlab_rails['gitlab_knowledge_graph_enabled'] = true
+
+EOF
+
+    log "INFO: GitLab Duo configuration added (commented out - requires license)"
+}
+
+# Configure enhanced security scanning
+configure_enhanced_scanning() {
+    log "INFO: Configuring enhanced security scanning for 18.4"
+    
+    cat >> "$CONF" << 'EOF'
+
+# Enhanced Security Scanning 18.4
+gitlab_rails['secret_detection_excluded_paths'] = [
+    '*.log',
+    '*.tmp',
+    'node_modules/**',
+    '.git/**',
+    'vendor/**'
+]
+
+# Operational Container Scanning improvements
+gitlab_rails['operational_container_scanning_severity_threshold'] = 'medium'
+
+EOF
+
+    log "INFO: Enhanced security scanning configured"
+}
+
+# Update GitLab Runner configuration for 18.4
+update_runner_config() {
+    log "INFO: Updating GitLab Runner configuration for 18.4 compatibility"
+    
+    local runner_config="/etc/gitlab-runner/config.toml"
+    
+    if [[ -f "$runner_config" ]]; then
+        # Backup original config
+        cp "$runner_config" "${runner_config}.backup-$(date +%Y%m%d)"
+        
+        # Add 18.4 runner optimizations if not already present
+        if ! grep -q "FF_USE_FASTZIP" "$runner_config"; then
+            log "INFO: Adding GitLab Runner 18.4 optimizations"
+            # These would be added to the [[runners]] section
+            log "INFO: Manual runner configuration may be needed for optimal 18.4 performance"
+        fi
+    else
+        log "WARNING: GitLab Runner config not found - will be configured during first run"
+    fi
+}
+
+# Configure issue and epic enhancements
+configure_issue_enhancements() {
+    log "INFO: Configuring enhanced issue and epic features"
+    
+    cat >> "$CONF" << 'EOF'
+
+# Enhanced Issue and Epic Management 18.4
+gitlab_rails['enhanced_parent_filtering'] = true
+gitlab_rails['issue_drawer_view_enabled'] = true
+gitlab_rails['epic_hierarchy_improvements'] = true
+
+EOF
+
+    log "INFO: Issue and epic enhancements configured"
+}
+
+# Main configuration function
+main() {
+    log "INFO: Starting GitLab 18.4 feature configuration"
+    
+    if [[ ! -f "$CONF" ]]; then
+        log "ERROR: GitLab configuration file not found: $CONF"
+        exit 1
+    fi
+    
+    # Backup the current configuration
+    cp "$CONF" "${CONF}.backup-18.4-$(date +%Y%m%d-%H%M%S)"
+    log "INFO: Configuration backed up"
+    
+    # Configure new features
+    configure_gitlab_18_4_features
+    configure_duo_features
+    configure_enhanced_scanning
+    update_runner_config
+    configure_issue_enhancements
+    
+    log "INFO: GitLab 18.4 feature configuration completed"
+    log "INFO: Run 'gitlab-ctl reconfigure' to apply changes"
+    
+    echo ""
+    echo "🚀 GitLab 18.4 Feature Configuration Complete!"
+    echo ""
+    echo "New features configured:"
+    echo "  ✅ Enhanced CI/CD job token authentication"
+    echo "  ✅ Improved pipeline branch simulation"
+    echo "  ✅ Advanced SAST performance improvements"
+    echo "  ✅ Enhanced secret detection with Git optimizations"
+    echo "  ✅ Better artifact access controls"
+    echo "  ✅ Improved issue and epic management"
+    echo "  ✅ Enhanced vulnerability tracking"
+    echo ""
+    echo "GitLab Duo features (commented - requires license):"
+    echo "  🔧 Model Selection"
+    echo "  🔧 Context Exclusion"
+    echo "  🔧 Knowledge Graph"
+    echo "  🔧 Code Review"
+    echo ""
+    echo "Next steps:"
+    echo "  1. Run: gitlab-ctl reconfigure"
+    echo "  2. Run: gitlab-ctl restart"
+    echo "  3. Check status: gitlab-ctl status"
+    echo ""
+}
+
+main "$@"

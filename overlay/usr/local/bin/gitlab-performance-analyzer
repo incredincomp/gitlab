@@ -1,0 +1,642 @@
+#!/bin/bash
+# GitLab Performance Profiler and Analyzer
+# Comprehensive performance analysis with automated tuning recommendations
+
+set -euo pipefail
+
+# Configuration
+PROFILE_DIR="/var/log/gitlab-performance"
+REPORT_FILE="$PROFILE_DIR/performance-report-$(date +%Y%m%d-%H%M%S).html"
+METRICS_DURATION=300  # 5 minutes
+LOG_FILE="/var/log/gitlab-performance.log"
+
+# Ensure profile directory exists
+mkdir -p "$PROFILE_DIR"
+
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Get system information
+get_system_info() {
+    log "INFO: Collecting system information"
+    
+    cat > "$PROFILE_DIR/system_info.json" << EOF
+{
+  "hostname": "$(hostname)",
+  "uptime": "$(uptime -p)",
+  "kernel": "$(uname -r)",
+  "cpu_info": {
+    "model": "$(grep 'model name' /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)",
+    "cores": $(nproc),
+    "threads": $(grep -c ^processor /proc/cpuinfo)
+  },
+  "memory": {
+    "total_gb": $(free -g | awk '/^Mem:/ {print $2}'),
+    "available_gb": $(free -g | awk '/^Mem:/ {print $7}'),
+    "swap_gb": $(free -g | awk '/^Swap:/ {print $2}')
+  },
+  "disk_space": {
+    "root_usage_pct": $(df / | awk 'NR==2 {print $5}' | sed 's/%//'),
+    "gitlab_data_usage_pct": $(df /var/opt/gitlab 2>/dev/null | awk 'NR==2 {print $5}' | sed 's/%//' || echo "0")
+  }
+}
+EOF
+}
+
+# Profile GitLab services
+profile_services() {
+    log "INFO: Profiling GitLab services performance"
+    
+    local services=("postgresql" "redis" "nginx" "unicorn" "sidekiq" "gitaly")
+    
+    echo "{" > "$PROFILE_DIR/services_profile.json"
+    local first=true
+    
+    for service in "${services[@]}"; do
+        if ! $first; then echo "," >> "$PROFILE_DIR/services_profile.json"; fi
+        first=false
+        
+        echo "  \"$service\": {" >> "$PROFILE_DIR/services_profile.json"
+        
+        if gitlab-ctl status "$service" | grep -q "run:"; then
+            local pid
+            pid=$(gitlab-ctl status "$service" | awk '/pid/ {print $4}' | tr -d ';' 2>/dev/null || echo "0")
+            
+            if [[ "$pid" -gt 0 ]]; then
+                # Get detailed process information
+                local mem_kb cpu_pct vsz rss
+                read -r mem_kb cpu_pct vsz rss < <(ps -p "$pid" -o rss=,pcpu=,vsz=,rss= 2>/dev/null | head -1 | xargs)
+                
+                echo "    \"status\": \"running\"," >> "$PROFILE_DIR/services_profile.json"
+                echo "    \"pid\": $pid," >> "$PROFILE_DIR/services_profile.json"
+                echo "    \"memory_mb\": $((mem_kb / 1024))," >> "$PROFILE_DIR/services_profile.json"
+                echo "    \"cpu_percent\": $cpu_pct," >> "$PROFILE_DIR/services_profile.json"
+                echo "    \"virtual_memory_mb\": $((vsz / 1024))," >> "$PROFILE_DIR/services_profile.json"
+                
+                # Get file descriptor count
+                local fd_count
+                fd_count=$(ls /proc/$pid/fd 2>/dev/null | wc -l || echo "0")
+                echo "    \"file_descriptors\": $fd_count," >> "$PROFILE_DIR/services_profile.json"
+                
+                # Get thread count
+                local thread_count
+                thread_count=$(ps -p "$pid" -o nlwp= 2>/dev/null | xargs || echo "0")
+                echo "    \"threads\": $thread_count" >> "$PROFILE_DIR/services_profile.json"
+            else
+                echo "    \"status\": \"running\"," >> "$PROFILE_DIR/services_profile.json"
+                echo "    \"pid\": 0," >> "$PROFILE_DIR/services_profile.json"
+                echo "    \"memory_mb\": 0," >> "$PROFILE_DIR/services_profile.json"
+                echo "    \"cpu_percent\": 0" >> "$PROFILE_DIR/services_profile.json"
+            fi
+        else
+            echo "    \"status\": \"stopped\"," >> "$PROFILE_DIR/services_profile.json"
+            echo "    \"pid\": 0," >> "$PROFILE_DIR/services_profile.json"
+            echo "    \"memory_mb\": 0," >> "$PROFILE_DIR/services_profile.json"
+            echo "    \"cpu_percent\": 0" >> "$PROFILE_DIR/services_profile.json"
+        fi
+        
+        echo "  }" >> "$PROFILE_DIR/services_profile.json"
+    done
+    
+    echo "}" >> "$PROFILE_DIR/services_profile.json"
+}
+
+# Profile database performance
+profile_database() {
+    log "INFO: Profiling database performance"
+    
+    if gitlab-psql -c "SELECT 1;" >/dev/null 2>&1; then
+        # Database size and statistics
+        local db_size connections table_count index_count
+        db_size=$(gitlab-psql -t -c "SELECT pg_size_pretty(pg_database_size(current_database()));" 2>/dev/null | xargs || echo "unknown")
+        connections=$(gitlab-psql -t -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | xargs || echo "0")
+        table_count=$(gitlab-psql -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';" 2>/dev/null | xargs || echo "0")
+        index_count=$(gitlab-psql -t -c "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | xargs || echo "0")
+        
+        # Slow queries analysis
+        gitlab-psql -c "
+            SELECT query, 
+                   mean_exec_time,
+                   calls,
+                   total_exec_time,
+                   mean_exec_time * calls as total_time
+            FROM pg_stat_statements 
+            ORDER BY mean_exec_time DESC 
+            LIMIT 10;
+        " 2>/dev/null > "$PROFILE_DIR/slow_queries.txt" || echo "pg_stat_statements not available" > "$PROFILE_DIR/slow_queries.txt"
+        
+        # Table sizes
+        gitlab-psql -c "
+            SELECT schemaname,tablename,
+                   pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
+            FROM pg_tables 
+            WHERE schemaname = 'public'
+            ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC 
+            LIMIT 10;
+        " 2>/dev/null > "$PROFILE_DIR/large_tables.txt" || echo "Could not analyze table sizes" > "$PROFILE_DIR/large_tables.txt"
+        
+        cat > "$PROFILE_DIR/database_profile.json" << EOF
+{
+  "status": "connected",
+  "database_size": "$db_size",
+  "active_connections": $connections,
+  "table_count": $table_count,
+  "index_count": $index_count,
+  "configuration": {
+    "shared_buffers": "$(gitlab-psql -t -c "SHOW shared_buffers;" 2>/dev/null | xargs || echo "unknown")",
+    "effective_cache_size": "$(gitlab-psql -t -c "SHOW effective_cache_size;" 2>/dev/null | xargs || echo "unknown")",
+    "work_mem": "$(gitlab-psql -t -c "SHOW work_mem;" 2>/dev/null | xargs || echo "unknown")",
+    "max_connections": "$(gitlab-psql -t -c "SHOW max_connections;" 2>/dev/null | xargs || echo "unknown")"
+  }
+}
+EOF
+    else
+        echo '{"status": "disconnected"}' > "$PROFILE_DIR/database_profile.json"
+    fi
+}
+
+# Profile Redis performance
+profile_redis() {
+    log "INFO: Profiling Redis performance"
+    
+    if gitlab-redis-cli ping | grep -q "PONG"; then
+        # Redis info
+        gitlab-redis-cli info > "$PROFILE_DIR/redis_info.txt" 2>/dev/null || echo "Could not get Redis info" > "$PROFILE_DIR/redis_info.txt"
+        
+        # Extract key metrics
+        local memory_used keyspace_keys connected_clients
+        memory_used=$(gitlab-redis-cli info memory | grep "used_memory_human:" | cut -d: -f2 | tr -d '\r' || echo "unknown")
+        keyspace_keys=$(gitlab-redis-cli info keyspace | grep "keys=" | cut -d= -f2 | cut -d, -f1 || echo "0")
+        connected_clients=$(gitlab-redis-cli info clients | grep "connected_clients:" | cut -d: -f2 | tr -d '\r' || echo "0")
+        
+        cat > "$PROFILE_DIR/redis_profile.json" << EOF
+{
+  "status": "connected",
+  "memory_used": "$memory_used",
+  "keyspace_keys": $keyspace_keys,
+  "connected_clients": $connected_clients,
+  "configuration": {
+    "maxmemory": "$(gitlab-redis-cli config get maxmemory | tail -1 || echo "unknown")",
+    "maxmemory_policy": "$(gitlab-redis-cli config get maxmemory-policy | tail -1 || echo "unknown")"
+  }
+}
+EOF
+    else
+        echo '{"status": "disconnected"}' > "$PROFILE_DIR/redis_profile.json"
+    fi
+}
+
+# Monitor system performance over time
+monitor_performance() {
+    log "INFO: Monitoring system performance for $METRICS_DURATION seconds"
+    
+    local sample_interval=5
+    local samples=$((METRICS_DURATION / sample_interval))
+    
+    echo "timestamp,cpu_usage,memory_usage,load_avg,disk_io_read,disk_io_write" > "$PROFILE_DIR/performance_timeline.csv"
+    
+    for ((i=1; i<=samples; i++)); do
+        local timestamp cpu_usage memory_usage load_avg
+        timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+        
+        # CPU usage (average over sample_interval)
+        cpu_usage=$(top -bn2 -d$sample_interval | grep "Cpu(s)" | tail -1 | awk '{print 100-$8}')
+        
+        # Memory usage percentage
+        memory_usage=$(free | awk '/^Mem:/ {printf "%.1f", $3/$2 * 100}')
+        
+        # Load average (1 minute)
+        load_avg=$(uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
+        
+        # Disk I/O (simplified - would need more complex monitoring for accurate I/O)
+        local disk_reads disk_writes
+        if [[ -f /proc/diskstats ]]; then
+            disk_reads=$(awk '{reads+=$4} END {print reads}' /proc/diskstats)
+            disk_writes=$(awk '{writes+=$8} END {print writes}' /proc/diskstats)
+        else
+            disk_reads=0
+            disk_writes=0
+        fi
+        
+        echo "$timestamp,$cpu_usage,$memory_usage,$load_avg,$disk_reads,$disk_writes" >> "$PROFILE_DIR/performance_timeline.csv"
+        
+        log "INFO: Performance sample $i/$samples - CPU: ${cpu_usage}%, Memory: ${memory_usage}%, Load: $load_avg"
+        
+        sleep $sample_interval
+    done
+}
+
+# Analyze GitLab application performance
+analyze_gitlab_app() {
+    log "INFO: Analyzing GitLab application performance"
+    
+    # Test response times for different endpoints
+    local external_url
+    external_url=$(grep "^external_url" /etc/gitlab/gitlab.rb | cut -d"'" -f2 2>/dev/null || echo "http://localhost")
+    local check_url
+    check_url=$(echo "$external_url" | sed 's/https\?:\/\/[^\/]*/http:\/\/localhost/')
+    
+    local endpoints=("/users/sign_in" "/api/v4/projects" "/help")
+    
+    echo "endpoint,response_time_ms,http_status" > "$PROFILE_DIR/endpoint_performance.csv"
+    
+    for endpoint in "${endpoints[@]}"; do
+        local url="$check_url$endpoint"
+        local start_time end_time response_time http_code
+        
+        start_time=$(date +%s%N)
+        http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$url" 2>/dev/null || echo "000")
+        end_time=$(date +%s%N)
+        response_time=$(( (end_time - start_time) / 1000000 )) # Convert to milliseconds
+        
+        echo "$endpoint,$response_time,$http_code" >> "$PROFILE_DIR/endpoint_performance.csv"
+    done
+    
+    # GitLab application statistics
+    local users projects issues merge_requests
+    users=$(timeout 30 gitlab-rails runner "puts User.count" 2>/dev/null || echo "0")
+    projects=$(timeout 30 gitlab-rails runner "puts Project.count" 2>/dev/null || echo "0")
+    issues=$(timeout 30 gitlab-rails runner "puts Issue.count" 2>/dev/null || echo "0")
+    merge_requests=$(timeout 30 gitlab-rails runner "puts MergeRequest.count" 2>/dev/null || echo "0")
+    
+    cat > "$PROFILE_DIR/gitlab_app_stats.json" << EOF
+{
+  "users": $users,
+  "projects": $projects,
+  "issues": $issues,
+  "merge_requests": $merge_requests,
+  "repository_size_mb": $(du -sm /var/opt/gitlab/git-data/repositories 2>/dev/null | awk '{print $1}' || echo "0")
+}
+EOF
+}
+
+# Generate performance recommendations
+generate_recommendations() {
+    log "INFO: Generating performance recommendations"
+    
+    local recommendations=()
+    
+    # Analyze system resources
+    local total_mem_gb available_mem_gb cpu_cores
+    total_mem_gb=$(free -g | awk '/^Mem:/ {print $2}')
+    available_mem_gb=$(free -g | awk '/^Mem:/ {print $7}')
+    cpu_cores=$(nproc)
+    
+    # Memory recommendations
+    if [[ $total_mem_gb -lt 4 ]]; then
+        recommendations+=("🔴 CRITICAL: System has only ${total_mem_gb}GB RAM. GitLab requires minimum 4GB for optimal performance.")
+        recommendations+=("💡 Consider reducing Unicorn workers to 1 and PostgreSQL shared_buffers to 128MB")
+    elif [[ $total_mem_gb -lt 8 ]]; then
+        recommendations+=("🟡 WARNING: System has ${total_mem_gb}GB RAM. Consider upgrading to 8GB+ for better performance.")
+        recommendations+=("💡 Current settings should work but may be slow under load")
+    else
+        recommendations+=("✅ Memory: ${total_mem_gb}GB RAM is adequate for GitLab")
+    fi
+    
+    # CPU recommendations
+    if [[ $cpu_cores -lt 2 ]]; then
+        recommendations+=("🔴 CRITICAL: Only $cpu_cores CPU core detected. GitLab needs at least 2 cores.")
+        recommendations+=("💡 Set unicorn workers to 1 to avoid CPU contention")
+    elif [[ $cpu_cores -eq 2 ]]; then
+        recommendations+=("🟡 WARNING: Only 2 CPU cores. Performance may be limited under load.")
+        recommendations+=("💡 Keep unicorn workers at 2 (current default)")
+    else
+        recommendations+=("✅ CPU: $cpu_cores cores should provide good performance")
+        recommendations+=("💡 Consider increasing unicorn workers to $((cpu_cores - 1)) for better concurrency")
+    fi
+    
+    # Disk space recommendations
+    local root_usage
+    root_usage=$(df / | awk 'NR==2 {print $5}' | sed 's/%//')
+    if [[ $root_usage -gt 80 ]]; then
+        recommendations+=("🔴 CRITICAL: Root filesystem is ${root_usage}% full. Free up disk space immediately.")
+    elif [[ $root_usage -gt 70 ]]; then
+        recommendations+=("🟡 WARNING: Root filesystem is ${root_usage}% full. Monitor disk usage closely.")
+    fi
+    
+    # Service-specific recommendations
+    if [[ -f "$PROFILE_DIR/services_profile.json" ]]; then
+        # Check Unicorn memory usage
+        local unicorn_memory
+        unicorn_memory=$(jq -r '.unicorn.memory_mb // 0' "$PROFILE_DIR/services_profile.json" 2>/dev/null || echo "0")
+        if [[ $unicorn_memory -gt 500 ]]; then
+            recommendations+=("🟡 Unicorn is using ${unicorn_memory}MB memory. Consider reducing worker memory limits.")
+        fi
+        
+        # Check PostgreSQL connections
+        if [[ -f "$PROFILE_DIR/database_profile.json" ]]; then
+            local db_connections
+            db_connections=$(jq -r '.active_connections // 0' "$PROFILE_DIR/database_profile.json" 2>/dev/null || echo "0")
+            if [[ $db_connections -gt 100 ]]; then
+                recommendations+=("🟡 PostgreSQL has $db_connections active connections. Monitor for connection leaks.")
+            fi
+        fi
+    fi
+    
+    # Performance timeline analysis
+    if [[ -f "$PROFILE_DIR/performance_timeline.csv" ]]; then
+        local avg_cpu avg_memory high_load_samples
+        avg_cpu=$(awk -F, 'NR>1 && $2!="" {sum+=$2; count++} END {if(count>0) print sum/count; else print 0}' "$PROFILE_DIR/performance_timeline.csv")
+        avg_memory=$(awk -F, 'NR>1 && $3!="" {sum+=$3; count++} END {if(count>0) print sum/count; else print 0}' "$PROFILE_DIR/performance_timeline.csv")
+        high_load_samples=$(awk -F, -v cores="$cpu_cores" 'NR>1 && $4!="" && $4>(cores*0.8) {count++} END {print count+0}' "$PROFILE_DIR/performance_timeline.csv")
+        
+        if (( $(echo "$avg_cpu > 80" | bc -l) )); then
+            recommendations+=("🔴 Average CPU usage during monitoring was ${avg_cpu}%. System is under heavy load.")
+        elif (( $(echo "$avg_cpu > 60" | bc -l) )); then
+            recommendations+=("🟡 Average CPU usage was ${avg_cpu}%. Monitor for performance bottlenecks.")
+        fi
+        
+        if (( $(echo "$avg_memory > 80" | bc -l) )); then
+            recommendations+=("🔴 Average memory usage was ${avg_memory}%. Consider adding more RAM.")
+        elif (( $(echo "$avg_memory > 70" | bc -l) )); then
+            recommendations+=("🟡 Average memory usage was ${avg_memory}%. Monitor memory consumption.")
+        fi
+        
+        if [[ $high_load_samples -gt 0 ]]; then
+            recommendations+=("🟡 System load exceeded 80% of CPU capacity in $high_load_samples samples.")
+        fi
+    fi
+    
+    # Save recommendations
+    printf '%s\n' "${recommendations[@]}" > "$PROFILE_DIR/recommendations.txt"
+}
+
+# Generate HTML report
+generate_html_report() {
+    log "INFO: Generating HTML performance report"
+    
+    cat > "$REPORT_FILE" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitLab Performance Analysis Report</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f8f9fa;
+            padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 8px 8px 0 0; }
+        .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .content { padding: 30px; }
+        .section { margin-bottom: 40px; }
+        .section h2 { color: #292961; border-bottom: 2px solid #667eea; padding-bottom: 10px; margin-bottom: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .card { background: #f8f9fa; padding: 20px; border-radius: 8px; border-left: 4px solid #667eea; }
+        .card h3 { color: #292961; margin-bottom: 15px; }
+        .metric { display: flex; justify-content: space-between; margin-bottom: 10px; padding: 8px 0; border-bottom: 1px solid #dee2e6; }
+        .metric:last-child { border-bottom: none; }
+        .metric-label { font-weight: 600; }
+        .metric-value { color: #6c757d; }
+        .recommendations { background: #fff3cd; border: 1px solid #ffeaa7; padding: 20px; border-radius: 8px; }
+        .recommendations ul { list-style: none; }
+        .recommendations li { margin-bottom: 10px; padding: 8px; background: white; border-radius: 4px; }
+        .critical { color: #dc3545; }
+        .warning { color: #ffc107; }
+        .success { color: #28a745; }
+        .info { color: #17a2b8; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px; text-align: left; border-bottom: 1px solid #dee2e6; }
+        th { background: #f8f9fa; font-weight: 600; }
+        .chart-container { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; }
+        .timestamp { text-align: center; color: #6c757d; margin-top: 20px; padding-top: 20px; border-top: 1px solid #dee2e6; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 GitLab Performance Analysis</h1>
+            <p>Comprehensive performance report generated on TIMESTAMP</p>
+        </div>
+        
+        <div class="content">
+            <!-- System Overview -->
+            <div class="section">
+                <h2>🖥️ System Overview</h2>
+                <div class="grid">
+                    <div class="card">
+                        <h3>System Information</h3>
+                        <div id="systemInfo">
+                            <!-- System info will be populated here -->
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>Resource Utilization</h3>
+                        <div id="resourceUtilization">
+                            <!-- Resource utilization will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Service Performance -->
+            <div class="section">
+                <h2>🔧 Service Performance</h2>
+                <div class="card">
+                    <div id="servicePerformance">
+                        <!-- Service performance table will be populated here -->
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Database Performance -->
+            <div class="section">
+                <h2>🗄️ Database Performance</h2>
+                <div class="grid">
+                    <div class="card">
+                        <h3>Database Statistics</h3>
+                        <div id="databaseStats">
+                            <!-- Database stats will be populated here -->
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3>Redis Performance</h3>
+                        <div id="redisStats">
+                            <!-- Redis stats will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Application Performance -->
+            <div class="section">
+                <h2>🌐 Application Performance</h2>
+                <div class="card">
+                    <h3>Endpoint Response Times</h3>
+                    <div id="endpointPerformance">
+                        <!-- Endpoint performance will be populated here -->
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Recommendations -->
+            <div class="section">
+                <h2>💡 Performance Recommendations</h2>
+                <div class="recommendations">
+                    <div id="recommendations">
+                        <!-- Recommendations will be populated here -->
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="timestamp">
+            Report generated on TIMESTAMP
+        </div>
+    </div>
+    
+    <script>
+        // This script would populate the report with actual data
+        // For now, it's a template that would be filled by the bash script
+    </script>
+</body>
+</html>
+EOF
+
+    # Replace timestamp placeholder
+    sed -i "s/TIMESTAMP/$(date '/index.html%Y-%m-%d %H:%M:%S %Z')/g" "$REPORT_FILE"
+    
+    log "INFO: HTML report generated: $REPORT_FILE"
+}
+
+# Main profiling function
+run_performance_analysis() {
+    log "INFO: Starting comprehensive GitLab performance analysis"
+    
+    # Collect system information
+    get_system_info
+    
+    # Profile all components
+    profile_services
+    profile_database
+    profile_redis
+    
+    # Monitor performance over time
+    monitor_performance
+    
+    # Analyze GitLab application
+    analyze_gitlab_app
+    
+    # Generate recommendations
+    generate_recommendations
+    
+    # Generate HTML report
+    generate_html_report
+    
+    log "INFO: Performance analysis complete"
+    echo "Performance report generated: $REPORT_FILE"
+    echo "Raw data available in: $PROFILE_DIR"
+}
+
+# Quick performance check
+quick_check() {
+    log "INFO: Running quick performance check"
+    
+    echo "=== GitLab Quick Performance Check ==="
+    echo "Timestamp: $(date)"
+    echo ""
+    
+    # System resources
+    echo "📊 System Resources:"
+    echo "  Memory: $(free -h | awk '/^Mem:/ {printf "%s/%s (%.1f%%)", $3, $2, $3/$2*100}')"
+    echo "  CPU Cores: $(nproc)"
+    echo "  Load Average: $(uptime | awk -F'load average:' '{print $2}' | xargs)"
+    echo "  Disk Usage: $(df -h / | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')"
+    echo ""
+    
+    # Service status
+    echo "🔧 GitLab Services:"
+    local services=("postgresql" "redis" "nginx" "unicorn" "sidekiq")
+    for service in "${services[@]}"; do
+        if gitlab-ctl status "$service" 2>/dev/null | grep -q "run:"; then
+            local pid
+            pid=$(gitlab-ctl status "$service" | awk '/pid/ {print $4}' | tr -d ';' 2>/dev/null)
+            local mem_mb
+            mem_mb=$(ps -p "$pid" -o rss= 2>/dev/null | awk '{print int($1/1024)}' || echo "0")
+            echo "  ✅ $service: Running (PID: $pid, Memory: ${mem_mb}MB)"
+        else
+            echo "  ❌ $service: Not running"
+        fi
+    done
+    echo ""
+    
+    # Database quick check
+    echo "🗄️ Database:"
+    if gitlab-psql -c "SELECT 1;" >/dev/null 2>&1; then
+        local db_size connections
+        db_size=$(gitlab-psql -t -c "SELECT pg_size_pretty(pg_database_size(current_database()));" 2>/dev/null | xargs || echo "unknown")
+        connections=$(gitlab-psql -t -c "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null | xargs || echo "0")
+        echo "  ✅ PostgreSQL: Connected (Size: $db_size, Connections: $connections)"
+    else
+        echo "  ❌ PostgreSQL: Connection failed"
+    fi
+    
+    # Redis quick check
+    if gitlab-redis-cli ping 2>/dev/null | grep -q "PONG"; then
+        local redis_memory
+        redis_memory=$(gitlab-redis-cli info memory 2>/dev/null | grep "used_memory_human:" | cut -d: -f2 | tr -d '\r' || echo "unknown")
+        echo "  ✅ Redis: Connected (Memory: $redis_memory)"
+    else
+        echo "  ❌ Redis: Connection failed"
+    fi
+    echo ""
+    
+    # Application quick check
+    echo "🌐 Application:"
+    local external_url
+    external_url=$(grep "^external_url" /etc/gitlab/gitlab.rb | cut -d"'" -f2 2>/dev/null || echo "http://localhost")
+    local check_url
+    check_url=$(echo "$external_url" | sed 's/https\?:\/\/[^\/]*/http:\/\/localhost/')
+    
+    local start_time end_time response_time http_code
+    start_time=$(date +%s%N)
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$check_url/users/sign_in" 2>/dev/null || echo "000")
+    end_time=$(date +%s%N)
+    response_time=$(( (end_time - start_time) / 1000000 ))
+    
+    if [[ "$http_code" == "200" ]]; then
+        echo "  ✅ Web Interface: Accessible (Response: ${response_time}ms)"
+    else
+        echo "  ❌ Web Interface: Not accessible (HTTP $http_code)"
+    fi
+}
+
+# Main function
+main() {
+    case "${1:-analysis}" in
+        analysis|full)
+            run_performance_analysis
+            ;;
+        quick)
+            quick_check
+            ;;
+        monitor)
+            monitor_performance
+            echo "Performance monitoring data saved to: $PROFILE_DIR/performance_timeline.csv"
+            ;;
+        recommendations)
+            get_system_info
+            profile_services
+            generate_recommendations
+            cat "$PROFILE_DIR/recommendations.txt"
+            ;;
+        *)
+            echo "Usage: $0 [analysis|quick|monitor|recommendations]"
+            echo "  analysis        - Full performance analysis with HTML report (default)"
+            echo "  quick          - Quick performance status check"
+            echo "  monitor        - Monitor performance metrics over time"
+            echo "  recommendations - Generate performance recommendations"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

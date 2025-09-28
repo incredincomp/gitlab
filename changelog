@@ -1,3 +1,36 @@
+turnkey-gitlab-18.2 (1) turnkey; urgency=low
+
+  * Update GitLab to latest GitLab-CE v18.4.x - via upstream apt repo.
+    - Includes GitLab Duo Model Selection (generally available)
+    - GitLab Knowledge Graph for enhanced code intelligence 
+    - Enhanced CI/CD job token authentication for Git push requests
+    - Significantly faster Advanced SAST scanning (up to 78% improvement)
+    - Enhanced security controls and vulnerability assessment features
+    - Improved secret detection with Git fetching optimizations
+    - Better pipeline simulation capabilities against different branches
+
+  * Enhanced container template with advanced security features:
+    - Comprehensive security scanner with WAF rules and vulnerability assessment
+    - Performance analyzer with detailed system profiling and recommendations
+    - Interactive setup wizard for easy GitLab configuration
+    - Monitoring integration with Prometheus metrics and Grafana dashboard
+    - Health check system with automated alerting capabilities
+
+  * Security and performance improvements:
+    - Fixed race conditions in GitLab initialization causing 500 errors
+    - Modernized APT key management using gpg --dearmor
+    - Enhanced service initialization with proper readiness checks
+    - Optimized database and Redis configurations for container environments
+    - Implemented secure random password generation
+
+  * Additional tooling and automation:
+    - Environment configuration management system
+    - Automated backup and restore capabilities  
+    - Comprehensive logging and monitoring integration
+    - Advanced security scanning with automated recommendations
+
+ -- incredincomp <dev@incredincomp.com>  Fri, 27 Sep 2025 12:00:00 +0000
+
 turnkey-gitlab-18.1 (1) turnkey; urgency=low
 
   * Update GitLab to latest GitLab-CE v17.3.0- via upstream apt repo.

@@ -1,0 +1,166 @@
+#!/bin/bash
+# GitLab Environment Configuration Script
+# Allows configuration via environment variables for container environments
+
+set -euo pipefail
+
+GITLAB_CONFIG="/etc/gitlab/gitlab.rb"
+BACKUP_CONFIG="/etc/gitlab/gitlab.rb.bak"
+
+# Function to add or update configuration
+update_config() {
+    local setting="$1"
+    local value="$2"
+    
+    # Create backup if it doesn't exist
+    if [[ ! -f "$BACKUP_CONFIG" ]]; then
+        cp "$GITLAB_CONFIG" "$BACKUP_CONFIG"
+    fi
+    
+    # Remove existing setting
+    sed -i "/^$setting/d" "$GITLAB_CONFIG"
+    
+    # Add new setting
+    echo "$setting = $value" >> "$GITLAB_CONFIG"
+}
+
+# Database configuration
+if [[ -n "${GITLAB_DB_HOST:-}" ]]; then
+    update_config "postgresql['enable']" "false"
+    update_config "gitlab_rails['db_host']" "'$GITLAB_DB_HOST'"
+fi
+
+if [[ -n "${GITLAB_DB_PORT:-}" ]]; then
+    update_config "gitlab_rails['db_port']" "$GITLAB_DB_PORT"
+fi
+
+if [[ -n "${GITLAB_DB_USERNAME:-}" ]]; then
+    update_config "gitlab_rails['db_username']" "'$GITLAB_DB_USERNAME'"
+fi
+
+if [[ -n "${GITLAB_DB_PASSWORD:-}" ]]; then
+    update_config "gitlab_rails['db_password']" "'$GITLAB_DB_PASSWORD'"
+fi
+
+if [[ -n "${GITLAB_DB_DATABASE:-}" ]]; then
+    update_config "gitlab_rails['db_database']" "'$GITLAB_DB_DATABASE'"
+fi
+
+# Redis configuration
+if [[ -n "${GITLAB_REDIS_HOST:-}" ]]; then
+    update_config "redis['enable']" "false"
+    update_config "gitlab_rails['redis_host']" "'$GITLAB_REDIS_HOST'"
+fi
+
+if [[ -n "${GITLAB_REDIS_PORT:-}" ]]; then
+    update_config "gitlab_rails['redis_port']" "$GITLAB_REDIS_PORT"
+fi
+
+if [[ -n "${GITLAB_REDIS_PASSWORD:-}" ]]; then
+    update_config "gitlab_rails['redis_password']" "'$GITLAB_REDIS_PASSWORD'"
+fi
+
+# Email configuration
+if [[ -n "${GITLAB_EMAIL_FROM:-}" ]]; then
+    update_config "gitlab_rails['gitlab_email_from']" "'$GITLAB_EMAIL_FROM'"
+fi
+
+if [[ -n "${GITLAB_EMAIL_DISPLAY_NAME:-}" ]]; then
+    update_config "gitlab_rails['gitlab_email_display_name']" "'$GITLAB_EMAIL_DISPLAY_NAME'"
+fi
+
+if [[ -n "${GITLAB_EMAIL_ENABLED:-}" ]]; then
+    update_config "gitlab_rails['gitlab_email_enabled']" "$GITLAB_EMAIL_ENABLED"
+fi
+
+# SMTP configuration
+if [[ -n "${GITLAB_SMTP_ENABLE:-}" && "$GITLAB_SMTP_ENABLE" == "true" ]]; then
+    update_config "gitlab_rails['smtp_enable']" "true"
+    
+    [[ -n "${GITLAB_SMTP_ADDRESS:-}" ]] && update_config "gitlab_rails['smtp_address']" "'$GITLAB_SMTP_ADDRESS'"
+    [[ -n "${GITLAB_SMTP_PORT:-}" ]] && update_config "gitlab_rails['smtp_port']" "$GITLAB_SMTP_PORT"
+    [[ -n "${GITLAB_SMTP_USER_NAME:-}" ]] && update_config "gitlab_rails['smtp_user_name']" "'$GITLAB_SMTP_USER_NAME'"
+    [[ -n "${GITLAB_SMTP_PASSWORD:-}" ]] && update_config "gitlab_rails['smtp_password']" "'$GITLAB_SMTP_PASSWORD'"
+    [[ -n "${GITLAB_SMTP_DOMAIN:-}" ]] && update_config "gitlab_rails['smtp_domain']" "'$GITLAB_SMTP_DOMAIN'"
+    [[ -n "${GITLAB_SMTP_AUTHENTICATION:-}" ]] && update_config "gitlab_rails['smtp_authentication']" "'$GITLAB_SMTP_AUTHENTICATION'"
+    [[ -n "${GITLAB_SMTP_ENABLE_STARTTLS_AUTO:-}" ]] && update_config "gitlab_rails['smtp_enable_starttls_auto']" "$GITLAB_SMTP_ENABLE_STARTTLS_AUTO"
+    [[ -n "${GITLAB_SMTP_TLS:-}" ]] && update_config "gitlab_rails['smtp_tls']" "$GITLAB_SMTP_TLS"
+fi
+
+# GitLab URL configuration
+if [[ -n "${GITLAB_EXTERNAL_URL:-}" ]]; then
+    update_config "external_url" "'$GITLAB_EXTERNAL_URL'"
+fi
+
+# HTTPS configuration
+if [[ -n "${GITLAB_HTTPS_ONLY:-}" && "$GITLAB_HTTPS_ONLY" == "true" ]]; then
+    update_config "nginx['redirect_http_to_https']" "true"
+fi
+
+# Let's Encrypt configuration
+if [[ -n "${GITLAB_LETSENCRYPT_ENABLE:-}" ]]; then
+    update_config "letsencrypt['enable']" "$GITLAB_LETSENCRYPT_ENABLE"
+fi
+
+if [[ -n "${GITLAB_LETSENCRYPT_CONTACT_EMAILS:-}" ]]; then
+    update_config "letsencrypt['contact_emails']" "['$GITLAB_LETSENCRYPT_CONTACT_EMAILS']"
+fi
+
+if [[ -n "${GITLAB_LETSENCRYPT_AUTO_RENEW:-}" ]]; then
+    update_config "letsencrypt['auto_renew']" "$GITLAB_LETSENCRYPT_AUTO_RENEW"
+fi
+
+# Performance tuning
+if [[ -n "${GITLAB_UNICORN_WORKERS:-}" ]]; then
+    update_config "unicorn['worker_processes']" "$GITLAB_UNICORN_WORKERS"
+fi
+
+if [[ -n "${GITLAB_UNICORN_TIMEOUT:-}" ]]; then
+    update_config "unicorn['worker_timeout']" "$GITLAB_UNICORN_TIMEOUT"
+fi
+
+if [[ -n "${GITLAB_POSTGRES_SHARED_BUFFERS:-}" ]]; then
+    update_config "postgresql['shared_buffers']" "'$GITLAB_POSTGRES_SHARED_BUFFERS'"
+fi
+
+if [[ -n "${GITLAB_POSTGRES_MAX_CONNECTIONS:-}" ]]; then
+    update_config "postgresql['max_connections']" "$GITLAB_POSTGRES_MAX_CONNECTIONS"
+fi
+
+if [[ -n "${GITLAB_REDIS_MAXMEMORY:-}" ]]; then
+    update_config "redis['maxmemory']" "'$GITLAB_REDIS_MAXMEMORY'"
+fi
+
+# Backup configuration
+if [[ -n "${GITLAB_BACKUP_KEEP_TIME:-}" ]]; then
+    update_config "gitlab_rails['backup_keep_time']" "$GITLAB_BACKUP_KEEP_TIME"
+fi
+
+if [[ -n "${GITLAB_BACKUP_PATH:-}" ]]; then
+    update_config "gitlab_rails['backup_path']" "'$GITLAB_BACKUP_PATH'"
+fi
+
+# SSH configuration
+if [[ -n "${GITLAB_SSH_HOST:-}" ]]; then
+    update_config "gitlab_rails['gitlab_ssh_host']" "'$GITLAB_SSH_HOST'"
+fi
+
+if [[ -n "${GITLAB_SSH_PORT:-}" ]]; then
+    update_config "gitlab_rails['gitlab_shell_ssh_port']" "$GITLAB_SSH_PORT"
+fi
+
+# Time zone
+if [[ -n "${GITLAB_TIME_ZONE:-}" ]]; then
+    update_config "gitlab_rails['time_zone']" "'$GITLAB_TIME_ZONE'"
+fi
+
+# Registry configuration
+if [[ -n "${GITLAB_REGISTRY_ENABLE:-}" ]]; then
+    update_config "registry['enable']" "$GITLAB_REGISTRY_ENABLE"
+fi
+
+if [[ -n "${GITLAB_REGISTRY_HOST:-}" ]]; then
+    update_config "registry_external_url" "'https://$GITLAB_REGISTRY_HOST'"
+fi
+
+echo "GitLab environment configuration completed. Run 'gitlab-ctl reconfigure' to apply changes."

@@ -1,0 +1,230 @@
+#!/bin/bash
+# GitLab Backup Verification Script
+# Verifies the integrity and completeness of GitLab backups
+
+set -euo pipefail
+
+# Configuration
+BACKUP_DIR="/var/opt/gitlab/backups"
+LOG_FILE="/var/log/gitlab-backup-verification.log"
+TEMP_DIR="/tmp/gitlab-backup-verify"
+
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Clean up function
+cleanup() {
+    if [[ -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+    fi
+}
+trap cleanup EXIT
+
+# Verify backup file integrity
+verify_backup_integrity() {
+    local backup_file="$1"
+    
+    log "INFO: Verifying integrity of backup file: $(basename "$backup_file")"
+    
+    if [[ ! -f "$backup_file" ]]; then
+        log "ERROR: Backup file not found: $backup_file"
+        return 1
+    fi
+    
+    # Check if it's a valid tar file
+    if ! tar -tf "$backup_file" >/dev/null 2>&1; then
+        log "ERROR: Backup file is not a valid tar archive: $backup_file"
+        return 1
+    fi
+    
+    log "INFO: Backup file integrity check passed"
+    return 0
+}
+
+# Verify backup contents
+verify_backup_contents() {
+    local backup_file="$1"
+    
+    log "INFO: Verifying contents of backup file: $(basename "$backup_file")"
+    
+    # Create temp directory for extraction
+    mkdir -p "$TEMP_DIR"
+    
+    # Extract backup to temp directory
+    if ! tar -xf "$backup_file" -C "$TEMP_DIR" 2>/dev/null; then
+        log "ERROR: Failed to extract backup file for content verification"
+        return 1
+    fi
+    
+    # Check for essential backup components
+    local required_files=(
+        "db/database.sql"
+        "repositories.tar.gz"
+        "uploads.tar.gz"
+        "builds.tar.gz"
+        "artifacts.tar.gz"
+        "lfs.tar.gz"
+        "backup_information.yml"
+    )
+    
+    local missing_files=()
+    
+    for file in "${required_files[@]}"; do
+        if [[ ! -f "$TEMP_DIR/$file" ]]; then
+            missing_files+=("$file")
+        fi
+    done
+    
+    if [[ ${#missing_files[@]} -gt 0 ]]; then
+        log "WARNING: Some backup components are missing:"
+        for file in "${missing_files[@]}"; do
+            log "  - $file"
+        done
+    else
+        log "INFO: All essential backup components are present"
+    fi
+    
+    # Verify backup_information.yml
+    if [[ -f "$TEMP_DIR/backup_information.yml" ]]; then
+        local gitlab_version
+        gitlab_version=$(grep "gitlab_version:" "$TEMP_DIR/backup_information.yml" | cut -d' ' -f2 2>/dev/null || echo "unknown")
+        log "INFO: Backup created with GitLab version: $gitlab_version"
+        
+        local backup_created_at
+        backup_created_at=$(grep "backup_created_at:" "$TEMP_DIR/backup_information.yml" | cut -d' ' -f2- 2>/dev/null || echo "unknown")
+        log "INFO: Backup created at: $backup_created_at"
+    fi
+    
+    # Verify database dump
+    if [[ -f "$TEMP_DIR/db/database.sql" ]]; then
+        local db_size
+        db_size=$(wc -c < "$TEMP_DIR/db/database.sql")
+        if [[ $db_size -lt 1024 ]]; then
+            log "WARNING: Database dump seems unusually small ($db_size bytes)"
+        else
+            log "INFO: Database dump size: $((db_size / 1024)) KB"
+        fi
+        
+        # Basic SQL syntax check
+        if head -10 "$TEMP_DIR/db/database.sql" | grep -q "PostgreSQL database dump"; then
+            log "INFO: Database dump appears to be valid PostgreSQL format"
+        else
+            log "WARNING: Database dump format could not be verified"
+        fi
+    fi
+    
+    return 0
+}
+
+# Get backup file size and age
+get_backup_info() {
+    local backup_file="$1"
+    
+    if [[ ! -f "$backup_file" ]]; then
+        return 1
+    fi
+    
+    local size_bytes
+    size_bytes=$(stat -c%s "$backup_file")
+    local size_mb=$((size_bytes / 1024 / 1024))
+    
+    local age_seconds
+    age_seconds=$(( $(date +%s) - $(stat -c%Y "$backup_file") ))
+    local age_hours=$((age_seconds / 3600))
+    
+    log "INFO: Backup file size: ${size_mb} MB"
+    log "INFO: Backup file age: ${age_hours} hours"
+    
+    # Warn if backup is very old
+    if [[ $age_hours -gt 168 ]]; then  # 7 days
+        log "WARNING: Backup is older than 7 days"
+    fi
+    
+    return 0
+}
+
+# Find latest backup file
+find_latest_backup() {
+    if [[ ! -d "$BACKUP_DIR" ]]; then
+        log "ERROR: Backup directory not found: $BACKUP_DIR"
+        return 1
+    fi
+    
+    local latest_backup
+    latest_backup=$(find "$BACKUP_DIR" -name "*_gitlab_backup.tar" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2- 2>/dev/null)
+    
+    if [[ -z "$latest_backup" ]]; then
+        log "ERROR: No backup files found in $BACKUP_DIR"
+        return 1
+    fi
+    
+    echo "$latest_backup"
+    return 0
+}
+
+# Main verification function
+verify_backup() {
+    local backup_file="$1"
+    local exit_code=0
+    
+    log "INFO: Starting backup verification for: $(basename "$backup_file")"
+    
+    get_backup_info "$backup_file" || exit_code=1
+    verify_backup_integrity "$backup_file" || exit_code=1
+    verify_backup_contents "$backup_file" || exit_code=1
+    
+    if [[ $exit_code -eq 0 ]]; then
+        log "INFO: Backup verification completed successfully"
+    else
+        log "ERROR: Backup verification failed"
+    fi
+    
+    return $exit_code
+}
+
+# Main function
+main() {
+    local backup_file="${1:-}"
+    
+    if [[ -z "$backup_file" ]]; then
+        log "INFO: No backup file specified, finding latest backup"
+        backup_file=$(find_latest_backup)
+        if [[ $? -ne 0 ]]; then
+            exit 1
+        fi
+    fi
+    
+    if [[ ! -f "$backup_file" ]]; then
+        log "ERROR: Backup file not found: $backup_file"
+        exit 1
+    fi
+    
+    verify_backup "$backup_file"
+}
+
+# Handle script arguments
+case "${1:-verify}" in
+    verify)
+        main "${2:-}"
+        ;;
+    list)
+        log "INFO: Available backup files:"
+        if [[ -d "$BACKUP_DIR" ]]; then
+            find "$BACKUP_DIR" -name "*_gitlab_backup.tar" -type f -exec basename {} \; | sort
+        else
+            log "ERROR: Backup directory not found: $BACKUP_DIR"
+        fi
+        ;;
+    latest)
+        find_latest_backup
+        ;;
+    *)
+        echo "Usage: $0 [verify [backup_file]|list|latest]"
+        echo "  verify [file]  - Verify backup integrity and contents (default: latest backup)"
+        echo "  list          - List available backup files"
+        echo "  latest        - Show path to latest backup file"
+        exit 1
+        ;;
+esac

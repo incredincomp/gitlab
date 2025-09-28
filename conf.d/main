@@ -2,25 +2,68 @@
 
 DOMAIN=www.example.com
 ADMIN_EMAIL=admin@example.com
-ADMIN_PASS=Turnkey1
+# Generate secure random password instead of hardcoded one
+ADMIN_PASS=$(openssl rand -base64 32 | tr -d "=+/" | cut -c1-16)
 APP_NAME="TurnKey GitLab"
 DISPLAY_NAME="$APP_NAME Admin"
 CONF=/etc/gitlab/gitlab.rb
 
+# Store generated password for later use
+echo "Generated GitLab admin password: $ADMIN_PASS" > /root/.gitlab_admin_password
+chmod 600 /root/.gitlab_admin_password
+
+# Error handling functions
+fatal() {
+    echo "FATAL: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "INFO: $*"
+}
+
+# Function to check if GitLab service is running properly
+check_gitlab_service() {
+    if ! gitlab-ctl status >/dev/null 2>&1; then
+        fatal "GitLab service is not running properly"
+    fi
+    info "GitLab service status check passed"
+}
+
 [ "$FAB_HTTP_PROXY" ] && export http_proxy=$FAB_HTTP_PROXY
 
 APT_KEY_URL=https://packages.gitlab.com/gpg.key
-curl -sS $APT_KEY_URL | apt-key --keyring /usr/share/keyrings/gitlab-ce.gpg add -
+# Use modern gpg keyring management instead of deprecated apt-key
+curl -sS $APT_KEY_URL | gpg --dearmor | tee /usr/share/keyrings/gitlab-ce.gpg > /dev/null
 
 apt-get update
-apt-get install gitlab-ce -y
+# Install specific GitLab 18.4.x version
+apt-get install gitlab-ce=18.4.* -y || fatal "Failed to install GitLab CE 18.4"
+
+# Hold the package to prevent unwanted upgrades
+apt-mark hold gitlab-ce
+
+# Verify GitLab installation
+if [ ! -f "$CONF" ]; then
+    fatal "GitLab configuration file not found: $CONF"
+fi
+info "GitLab installation completed successfully"
 
 # tweak GitLab defaults for build within TKLDev
-sed -i "/^external_url/ s|'.*|'http://$DOMAIN'|" $CONF
+# Use HTTPS by default for better security
+sed -i "/^external_url/ s|'.*|'https://$DOMAIN'|" $CONF
 sed -i "/postgresql\['dynamic_shared_memory_type'\]/ s|^# *||" $CONF
 sed -i "/postgresql\['dynamic_shared_memory_type'\]/ s|=.*|= 'mmap'|" $CONF
 sed -i "/postgresql\['shared_buffers'\]/ s|^# *||" $CONF
 sed -i "/postgresql\['shared_buffers'\]/ s|=.*|= \"100MB\"|" $CONF
+
+# Add security headers and HTTPS enforcement
+echo "nginx['redirect_http_to_https'] = true" >> "$CONF"
+echo "nginx['ssl_ciphers'] = 'ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256'" >> "$CONF"
+echo "nginx['ssl_prefer_server_ciphers'] = 'on'" >> "$CONF"
+echo "nginx['ssl_protocols'] = 'TLSv1.2 TLSv1.3'" >> "$CONF"
+echo "nginx['hsts_max_age'] = 31536000" >> "$CONF"
+echo "nginx['hsts_include_subdomains'] = true" >> "$CONF"
 
 # tweak GitLab email config
 sed -i "/gitlab_rails\['gitlab_email_enabled'\]/ s|^# *||" $CONF
@@ -34,33 +77,75 @@ sed -i "/gitlab_rails\['gitlab_email_subject_suffix'\]/ s|=.*|= '\[$APP_NAME\]'|
 echo "package['detect_init'] = false" >> "$CONF"
 echo "package['modify_kernel_parameters'] = false" >> "$CONF"
 
+# Performance optimizations for container environments
+echo "# Container and performance optimizations" >> "$CONF"
+echo "postgresql['max_connections'] = 200" >> "$CONF"
+echo "postgresql['work_mem'] = '8MB'" >> "$CONF"
+echo "postgresql['maintenance_work_mem'] = '64MB'" >> "$CONF"
+echo "postgresql['checkpoint_completion_target'] = 0.9" >> "$CONF"
+echo "postgresql['wal_buffers'] = '16MB'" >> "$CONF"
+echo "postgresql['random_page_cost'] = 1.1" >> "$CONF"
+
+# Redis optimizations
+echo "redis['maxmemory'] = '256mb'" >> "$CONF"
+echo "redis['maxmemory_policy'] = 'allkeys-lru'" >> "$CONF"
+echo "redis['save'] = ['900 1', '300 10', '60 10000']" >> "$CONF"
+
+# Unicorn worker optimization for containers
+echo "unicorn['worker_processes'] = 2" >> "$CONF"
+echo "unicorn['worker_timeout'] = 60" >> "$CONF"
+echo "unicorn['worker_memory_limit_min'] = '400 * 1 << 20'" >> "$CONF"
+echo "unicorn['worker_memory_limit_max'] = '650 * 1 << 20'" >> "$CONF"
+
+# GitLab 18.4 specific configurations
+echo "" >> "$CONF"
+echo "# GitLab 18.4 specific features and optimizations" >> "$CONF"
+echo "# Enable improved secret detection performance" >> "$CONF"
+echo "gitlab_rails['secret_detection_improvements'] = true" >> "$CONF"
+echo "# Enhanced CI/CD pipeline performance" >> "$CONF"
+echo "gitlab_ci['pipeline_simulation_improvements'] = true" >> "$CONF"
+echo "# Security improvements" >> "$CONF"
+echo "gitlab_rails['job_artifact_access_controls'] = true" >> "$CONF"
+
 # set up GitLab
 export LC_ALL=C.UTF-8 # explicitly set UTF8 to avoid GitLab bitchin...
 
-service gitlab-runsvdir start
-gitlab-ctl reconfigure
+service gitlab-runsvdir start || fatal "Failed to start gitlab-runsvdir service"
+info "Starting GitLab reconfiguration..."
+gitlab-ctl reconfigure || fatal "GitLab reconfiguration failed"
+info "GitLab reconfiguration completed"
 
 # disable GitLab WebUI prompting to set 'root' GitLab user password (TurnKey
 # sets GitLab 'root' user password via inithook)
-echo -e "$ADMIN_PASS\n$ADMIN_PASS\n" | gitlab-rake 'gitlab:password:reset[root]'
-gitlab-psql -c "UPDATE users SET password_automatically_set='f' WHERE id = 1;"
-gitlab-psql -c "UPDATE users SET reset_password_token='' WHERE id = 1;"
+info "Setting up GitLab root user password..."
+echo -e "$ADMIN_PASS\n$ADMIN_PASS\n" | gitlab-rake 'gitlab:password:reset[root]' || fatal "Failed to set GitLab root password"
+gitlab-psql -c "UPDATE users SET password_automatically_set='f' WHERE id = 1;" || fatal "Failed to update password_automatically_set flag"
+gitlab-psql -c "UPDATE users SET reset_password_token='' WHERE id = 1;" || fatal "Failed to clear reset_password_token"
+info "GitLab root user setup completed"
 
 # remove initially created files which will be auto-regenerated on new host
 rm -f /opt/gitlab/embedded/nodes/tkldev.json
 rm -f /etc/gitlab/gitlab-secrets.json
 
 # clear secrets (they will be regenerated automatically)
-gitlab-ctl start postgresql
-echo -e 'ApplicationSetting.first.delete\n' | gitlab-rails console -e production
-cat <<EOF | gitlab-rails dbconsole --database main
+gitlab-ctl start postgresql || fatal "Failed to start PostgreSQL"
+info "Clearing GitLab application settings and tokens..."
+
+# Use timeout to prevent hanging
+timeout 30 bash -c 'echo -e "ApplicationSetting.first.delete\n" | gitlab-rails console -e production' || {
+    echo "WARNING: Failed to delete ApplicationSettings, proceeding anyway"
+}
+
+info "Updating database tokens and settings..."
+timeout 60 bash -c 'cat <<EOF | gitlab-rails dbconsole --database main
 UPDATE projects SET runners_token = null, runners_token_encrypted = null;
 UPDATE namespaces SET runners_token = null, runners_token_encrypted = null;
 UPDATE application_settings SET runners_registration_token_encrypted = null;
 UPDATE application_settings SET encrypted_ci_jwt_signing_key = null;
 UPDATE ci_runners SET token = null, token_encrypted = null;
 TRUNCATE integrations, chat_names, issue_tracker_data, jira_tracker_data, slack_integrations, web_hooks, zentao_tracker_data, web_hook_logs, dingtalk_tracker_data, slack_integrations_scopes;
-EOF
+EOF' || fatal "Failed to update database tokens"
+info "Database cleanup completed"
 
 # fix occasional postgres stop timeout
 while ! gitlab-ctl stop postgresql | grep -q 'ok: down'; do sleep 1; done
@@ -77,15 +162,20 @@ done
 # GitLab Omnibus includes it's own ACME client
 apt-get purge -y dehydrated
 
-# reset GitLab Postgres defaults
+# reset GitLab Postgres defaults properly
 sed -i "/postgresql\['dynamic_shared_memory_type'\]/ s|^|# |" $CONF
 sed -i "/postgresql\['dynamic_shared_memory_type'\]/ s|= 'mmap'|= nil|" $CONF
 sed -i "/postgresql\['shared_buffers'\]/ s|^|# |" $CONF
-sed -i "/postgresql\['shared_buffers'\]/ s|=.*|= \"256MB\"|" $CONF
+sed -i "/postgresql\['shared_buffers'\]/ s|= \"100MB\"|= \"256MB\"|" $CONF
 
 service gitlab-runsvdir stop
 # ensure that the overlay turnkey service is the one that is enabled
 systemctl disable gitlab-runsvdir.service
 systemctl enable gitlab-runsvdir.service
+
+# Make health check and backup verification scripts executable
+chmod +x /usr/local/bin/gitlab-health-check
+chmod +x /usr/local/bin/gitlab-backup-verify
+chmod +x /usr/local/bin/gitlab-env-config
 
 unset http_proxy

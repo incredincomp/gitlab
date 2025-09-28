@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""
+GitLab Container Setup Wizard
+Interactive web-based configuration tool for GitLab container deployment
+"""
+
+import os
+import sys
+import json
+import subprocess
+import tempfile
+import secrets
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+import threading
+import webbrowser
+import time
+
+class GitLabSetupWizard:
+    def __init__(self):
+        self.config = {
+            'external_url': 'https://gitlab.example.com',
+            'admin_email': 'admin@example.com',
+            'admin_password': self.generate_password(),
+            'https_only': True,
+            'letsencrypt_enabled': False,
+            'letsencrypt_email': '',
+            'smtp_enabled': False,
+            'smtp_settings': {},
+            'database_settings': {'type': 'internal'},
+            'redis_settings': {'type': 'internal'},
+            'performance_settings': {
+                'unicorn_workers': 2,
+                'postgres_shared_buffers': '256MB',
+                'redis_maxmemory': '256mb'
+            },
+            'backup_settings': {
+                'enabled': True,
+                'retention_days': 7,
+                'path': '/var/opt/gitlab/backups'
+            },
+            'monitoring_enabled': True,
+            'security_headers': True
+        }
+        self.steps_completed = set()
+        
+    def generate_password(self):
+        """Generate a secure random password"""
+        return secrets.token_urlsafe(16)
+    
+    def get_html_template(self):
+        """Return the main HTML template"""
+        return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GitLab Container Setup Wizard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .wizard-container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 800px;
+            overflow: hidden;
+        }
+        .wizard-header {
+            background: #292961;
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .wizard-header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        .wizard-header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        .progress-bar {
+            background: #f8f9fa;
+            height: 8px;
+            position: relative;
+        }
+        .progress-fill {
+            background: linear-gradient(90deg, #667eea, #764ba2);
+            height: 100%;
+            transition: width 0.3s ease;
+        }
+        .wizard-content {
+            padding: 40px;
+        }
+        .step {
+            display: none;
+            animation: fadeIn 0.5s ease-in;
+        }
+        .step.active {
+            display: block;
+        }
+        .step h2 {
+            color: #292961;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+        }
+        .form-group {
+            margin-bottom: 25px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+        }
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e5e9;
+            border-radius: 6px;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
+        }
+        .form-group input:focus, .form-group select:focus, .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .checkbox-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 10px;
+        }
+        .button-group {
+            display: flex;
+            gap: 15px;
+            margin-top: 30px;
+        }
+        .btn {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .btn-primary {
+            background: linear-gradient(45deg, #667eea, #764ba2);
+            color: white;
+        }
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        .btn-secondary {
+            background: #f8f9fa;
+            color: #6c757d;
+            border: 2px solid #e1e5e9;
+        }
+        .btn-secondary:hover {
+            background: #e9ecef;
+        }
+        .alert {
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+        .alert-info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .config-summary {
+            background: #f8f9fa;
+            border-radius: 6px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        .config-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #dee2e6;
+        }
+        .config-item:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+            padding-bottom: 0;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .two-column {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        @media (max-width: 768px) {
+            .two-column {
+                grid-template-columns: 1fr;
+            }
+            .wizard-content {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="wizard-container">
+        <div class="wizard-header">
+            <h1>🦊 GitLab Setup Wizard</h1>
+            <p>Configure your GitLab container deployment</p>
+        </div>
+        
+        <div class="progress-bar">
+            <div class="progress-fill" id="progressFill" style="width: 16.67%"></div>
+        </div>
+        
+        <div class="wizard-content">
+            <!-- Step 1: Basic Configuration -->
+            <div class="step active" id="step1">
+                <h2>📋 Basic Configuration</h2>
+                <div class="alert alert-info">
+                    <strong>Welcome!</strong> Let's configure the essential settings for your GitLab instance.
+                </div>
+                
+                <div class="form-group">
+                    <label for="external_url">External URL</label>
+                    <input type="url" id="external_url" placeholder="https://gitlab.example.com" required>
+                    <small>This is the URL users will use to access GitLab</small>
+                </div>
+                
+                <div class="form-group">
+                    <label for="admin_email">Administrator Email</label>
+                    <input type="email" id="admin_email" placeholder="admin@example.com" required>
+                </div>
+                
+                <div class="form-group">
+                    <label for="admin_password">Administrator Password</label>
+                    <input type="password" id="admin_password" minlength="8" required>
+                    <small>Minimum 8 characters. A secure password has been generated for you.</small>
+                </div>
+                
+                <div class="checkbox-group">
+                    <input type="checkbox" id="https_only" checked>
+                    <label for="https_only">Force HTTPS redirect (recommended)</label>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-primary" onclick="nextStep()">Next Step →</button>
+                </div>
+            </div>
+            
+            <!-- Step 2: SSL/TLS Configuration -->
+            <div class="step" id="step2">
+                <h2>🔒 SSL/TLS Configuration</h2>
+                <div class="alert alert-info">
+                    Configure SSL certificates for secure HTTPS connections.
+                </div>
+                
+                <div class="checkbox-group">
+                    <input type="checkbox" id="letsencrypt_enabled">
+                    <label for="letsencrypt_enabled">Enable Let's Encrypt automatic SSL certificates</label>
+                </div>
+                
+                <div class="form-group" id="letsencrypt_email_group" style="display: none;">
+                    <label for="letsencrypt_email">Let's Encrypt Contact Email</label>
+                    <input type="email" id="letsencrypt_email" placeholder="ssl@example.com">
+                </div>
+                
+                <div class="checkbox-group">
+                    <input type="checkbox" id="security_headers" checked>
+                    <label for="security_headers">Enable security headers (HSTS, etc.)</label>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-secondary" onclick="prevStep()">← Previous</button>
+                    <button type="button" class="btn btn-primary" onclick="nextStep()">Next Step →</button>
+                </div>
+            </div>
+            
+            <!-- Step 3: Email Configuration -->
+            <div class="step" id="step3">
+                <h2>📧 Email Configuration</h2>
+                <div class="alert alert-info">
+                    Configure email settings for notifications and user registration.
+                </div>
+                
+                <div class="checkbox-group">
+                    <input type="checkbox" id="smtp_enabled">
+                    <label for="smtp_enabled">Enable SMTP email delivery</label>
+                </div>
+                
+                <div id="smtp_settings" style="display: none;">
+                    <div class="two-column">
+                        <div class="form-group">
+                            <label for="smtp_address">SMTP Server</label>
+                            <input type="text" id="smtp_address" placeholder="smtp.gmail.com">
+                        </div>
+                        <div class="form-group">
+                            <label for="smtp_port">SMTP Port</label>
+                            <input type="number" id="smtp_port" value="587">
+                        </div>
+                    </div>
+                    
+                    <div class="two-column">
+                        <div class="form-group">
+                            <label for="smtp_username">Username</label>
+                            <input type="text" id="smtp_username">
+                        </div>
+                        <div class="form-group">
+                            <label for="smtp_password">Password</label>
+                            <input type="password" id="smtp_password">
+                        </div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="smtp_domain">Domain</label>
+                        <input type="text" id="smtp_domain" placeholder="example.com">
+                    </div>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-secondary" onclick="prevStep()">← Previous</button>
+                    <button type="button" class="btn btn-primary" onclick="nextStep()">Next Step →</button>
+                </div>
+            </div>
+            
+            <!-- Step 4: Performance Settings -->
+            <div class="step" id="step4">
+                <h2>⚡ Performance Settings</h2>
+                <div class="alert alert-info">
+                    Optimize GitLab performance for your container environment.
+                </div>
+                
+                <div class="two-column">
+                    <div class="form-group">
+                        <label for="unicorn_workers">Unicorn Workers</label>
+                        <input type="number" id="unicorn_workers" min="1" max="8" value="2">
+                        <small>Recommended: 2 for containers</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="postgres_shared_buffers">PostgreSQL Shared Buffers</label>
+                        <select id="postgres_shared_buffers">
+                            <option value="128MB">128MB (Low memory)</option>
+                            <option value="256MB" selected>256MB (Recommended)</option>
+                            <option value="512MB">512MB (High memory)</option>
+                            <option value="1GB">1GB (Very high memory)</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="form-group">
+                    <label for="redis_maxmemory">Redis Max Memory</label>
+                    <select id="redis_maxmemory">
+                        <option value="128mb">128MB</option>
+                        <option value="256mb" selected>256MB</option>
+                        <option value="512mb">512MB</option>
+                        <option value="1gb">1GB</option>
+                    </select>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-secondary" onclick="prevStep()">← Previous</button>
+                    <button type="button" class="btn btn-primary" onclick="nextStep()">Next Step →</button>
+                </div>
+            </div>
+            
+            <!-- Step 5: Backup Configuration -->
+            <div class="step" id="step5">
+                <h2>💾 Backup Configuration</h2>
+                <div class="alert alert-info">
+                    Configure automatic backups to protect your data.
+                </div>
+                
+                <div class="checkbox-group">
+                    <input type="checkbox" id="backup_enabled" checked>
+                    <label for="backup_enabled">Enable automatic backups</label>
+                </div>
+                
+                <div id="backup_settings">
+                    <div class="two-column">
+                        <div class="form-group">
+                            <label for="backup_retention">Retention Period (days)</label>
+                            <input type="number" id="backup_retention" min="1" max="365" value="7">
+                        </div>
+                        <div class="form-group">
+                            <label for="backup_path">Backup Path</label>
+                            <input type="text" id="backup_path" value="/var/opt/gitlab/backups">
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="checkbox-group">
+                    <input type="checkbox" id="monitoring_enabled" checked>
+                    <label for="monitoring_enabled">Enable monitoring and metrics collection</label>
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-secondary" onclick="prevStep()">← Previous</button>
+                    <button type="button" class="btn btn-primary" onclick="nextStep()">Next Step →</button>
+                </div>
+            </div>
+            
+            <!-- Step 6: Review and Deploy -->
+            <div class="step" id="step6">
+                <h2>🚀 Review and Deploy</h2>
+                <div class="alert alert-success">
+                    <strong>Ready to deploy!</strong> Review your configuration below.
+                </div>
+                
+                <div class="config-summary" id="configSummary">
+                    <!-- Configuration summary will be populated here -->
+                </div>
+                
+                <div class="button-group">
+                    <button type="button" class="btn btn-secondary" onclick="prevStep()">← Previous</button>
+                    <button type="button" class="btn btn-primary" onclick="deployGitLab()">🚀 Deploy GitLab</button>
+                </div>
+            </div>
+            
+            <!-- Deployment Progress -->
+            <div class="step" id="deployment">
+                <h2>⚙️ Deploying GitLab</h2>
+                <div class="alert alert-info">
+                    Please wait while GitLab is being configured and deployed...
+                </div>
+                
+                <div id="deploymentProgress">
+                    <p>Initializing deployment...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let currentStep = 1;
+        const totalSteps = 6;
+        
+        // Initialize with generated values
+        document.getElementById('admin_password').value = generatePassword();
+        
+        // Event listeners
+        document.getElementById('letsencrypt_enabled').addEventListener('change', function() {
+            document.getElementById('letsencrypt_email_group').style.display = 
+                this.checked ? 'block' : 'none';
+        });
+        
+        document.getElementById('smtp_enabled').addEventListener('change', function() {
+            document.getElementById('smtp_settings').style.display = 
+                this.checked ? 'block' : 'none';
+        });
+        
+        document.getElementById('backup_enabled').addEventListener('change', function() {
+            document.getElementById('backup_settings').style.display = 
+                this.checked ? 'block' : 'none';
+        });
+        
+        function generatePassword() {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*';
+            let password = '';
+            for (let i = 0; i < 16; i++) {
+                password += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return password;
+        }
+        
+        function updateProgress() {
+            const progress = (currentStep / totalSteps) * 100;
+            document.getElementById('progressFill').style.width = progress + '%';
+        }
+        
+        function showStep(stepNumber) {
+            // Hide all steps
+            document.querySelectorAll('.step').forEach(step => {
+                step.classList.remove('active');
+            });
+            
+            // Show current step
+            document.getElementById('step' + stepNumber).classList.add('active');
+            currentStep = stepNumber;
+            updateProgress();
+        }
+        
+        function nextStep() {
+            if (currentStep < totalSteps) {
+                if (currentStep === 5) {
+                    showConfigurationSummary();
+                }
+                showStep(currentStep + 1);
+            }
+        }
+        
+        function prevStep() {
+            if (currentStep > 1) {
+                showStep(currentStep - 1);
+            }
+        }
+        
+        function showConfigurationSummary() {
+            const config = gatherConfiguration();
+            const summary = document.getElementById('configSummary');
+            
+            let html = '';
+            for (const [key, value] of Object.entries(config)) {
+                if (typeof value === 'object' && value !== null) {
+                    html += `<div class="config-item"><strong>${key}:</strong> <span>${JSON.stringify(value)}</span></div>`;
+                } else {
+                    html += `<div class="config-item"><strong>${key}:</strong> <span>${value}</span></div>`;
+                }
+            }
+            
+            summary.innerHTML = html;
+        }
+        
+        function gatherConfiguration() {
+            return {
+                'External URL': document.getElementById('external_url').value,
+                'Admin Email': document.getElementById('admin_email').value,
+                'HTTPS Only': document.getElementById('https_only').checked,
+                'Lets Encrypt': document.getElementById('letsencrypt_enabled').checked,
+                'SMTP Enabled': document.getElementById('smtp_enabled').checked,
+                'Unicorn Workers': document.getElementById('unicorn_workers').value,
+                'PostgreSQL Shared Buffers': document.getElementById('postgres_shared_buffers').value,
+                'Redis Max Memory': document.getElementById('redis_maxmemory').value,
+                'Backup Enabled': document.getElementById('backup_enabled').checked,
+                'Backup Retention': document.getElementById('backup_retention').value + ' days',
+                'Monitoring Enabled': document.getElementById('monitoring_enabled').checked
+            };
+        }
+        
+        async function deployGitLab() {
+            showStep(7); // Show deployment step
+            const config = gatherConfiguration();
+            
+            try {
+                const response = await fetch('/deploy', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(config)
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    document.getElementById('deploymentProgress').innerHTML = `
+                        <div class="alert alert-success">
+                            <strong>Deployment successful!</strong><br>
+                            GitLab is now running at: <a href="${config['External URL']}" target="_blank">${config['External URL']}</a><br>
+                            Admin credentials have been configured as specified.
+                        </div>
+                    `;
+                } else {
+                    document.getElementById('deploymentProgress').innerHTML = `
+                        <div class="alert alert-danger">
+                            <strong>Deployment failed!</strong><br>
+                            Error: ${result.error}
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                document.getElementById('deploymentProgress').innerHTML = `
+                    <div class="alert alert-danger">
+                        <strong>Deployment failed!</strong><br>
+                        Error: ${error.message}
+                    </div>
+                `;
+            }
+        }
+        
+        // Initialize
+        updateProgress();
+    </script>
+</body>
+</html>
+        """
+    
+    def apply_configuration(self, config):
+        """Apply the configuration to GitLab"""
+        try:
+            # Generate GitLab configuration
+            gitlab_config = self.generate_gitlab_config(config)
+            
+            # Write configuration to file
+            config_path = '/etc/gitlab/gitlab.rb'
+            with open(config_path, 'w') as f:
+                f.write(gitlab_config)
+            
+            # Set environment variables for our env-config script
+            env_vars = self.generate_env_vars(config)
+            for key, value in env_vars.items():
+                os.environ[key] = str(value)
+            
+            # Run environment configuration
+            subprocess.run(['/usr/local/bin/gitlab-env-config'], check=True)
+            
+            # Reconfigure GitLab
+            subprocess.run(['gitlab-ctl', 'reconfigure'], check=True)
+            
+            # Set admin password
+            if 'admin_password' in config:
+                self.set_admin_password(config['admin_password'])
+            
+            return True, "Configuration applied successfully"
+            
+        except Exception as e:
+            return False, str(e)
+    
+    def generate_gitlab_config(self, config):
+        """Generate GitLab configuration file content"""
+        lines = [
+            "# GitLab configuration generated by Setup Wizard",
+            f"external_url '{config.get('External URL', 'https://gitlab.example.com')}'",
+            "",
+            "# Email configuration",
+            f"gitlab_rails['gitlab_email_enabled'] = true",
+            f"gitlab_rails['gitlab_email_from'] = '{config.get('Admin Email', 'admin@example.com')}'",
+            ""
+        ]
+        
+        if config.get('HTTPS Only'):
+            lines.extend([
+                "# HTTPS configuration",
+                "nginx['redirect_http_to_https'] = true",
+                ""
+            ])
+        
+        if config.get('Lets Encrypt'):
+            lines.extend([
+                "# Let's Encrypt configuration",
+                "letsencrypt['enable'] = true",
+                "letsencrypt['auto_renew'] = true",
+                ""
+            ])
+        
+        # Performance settings
+        lines.extend([
+            "# Performance optimization",
+            f"unicorn['worker_processes'] = {config.get('Unicorn Workers', 2)}",
+            f"postgresql['shared_buffers'] = '{config.get('PostgreSQL Shared Buffers', '256MB')}'",
+            f"redis['maxmemory'] = '{config.get('Redis Max Memory', '256mb')}'",
+            ""
+        ])
+        
+        # Backup settings
+        if config.get('Backup Enabled'):
+            retention_seconds = int(config.get('Backup Retention', '7').split()[0]) * 24 * 3600
+            lines.extend([
+                "# Backup configuration",
+                f"gitlab_rails['backup_keep_time'] = {retention_seconds}",
+                ""
+            ])
+        
+        return '\n'.join(lines)
+    
+    def generate_env_vars(self, config):
+        """Generate environment variables for configuration"""
+        env_vars = {}
+        
+        if config.get('External URL'):
+            env_vars['GITLAB_EXTERNAL_URL'] = config['External URL']
+        
+        if config.get('Admin Email'):
+            env_vars['GITLAB_EMAIL_FROM'] = config['Admin Email']
+        
+        if config.get('HTTPS Only'):
+            env_vars['GITLAB_HTTPS_ONLY'] = 'true'
+        
+        if config.get('Lets Encrypt'):
+            env_vars['GITLAB_LETSENCRYPT_ENABLE'] = 'true'
+            env_vars['GITLAB_LETSENCRYPT_AUTO_RENEW'] = 'true'
+        
+        return env_vars
+    
+    def set_admin_password(self, password):
+        """Set GitLab admin password"""
+        cmd = ['gitlab-rake', 'gitlab:password:reset[root]']
+        process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = process.communicate(input=f"{password}\n{password}\n")
+        
+        if process.returncode != 0:
+            raise Exception(f"Failed to set admin password: {stderr}")
+
+class WizardHandler(BaseHTTPRequestHandler):
+    def __init__(self, wizard, *args, **kwargs):
+        self.wizard = wizard
+        super().__init__(*args, **kwargs)
+    
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(self.wizard.get_html_template().encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_POST(self):
+        if self.path == '/deploy':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            
+            try:
+                config = json.loads(post_data.decode())
+                success, message = self.wizard.apply_configuration(config)
+                
+                response = {
+                    'success': success,
+                    'message': message
+                }
+                
+                if not success:
+                    response['error'] = message
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps(response).encode())
+                
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                error_response = {'success': False, 'error': str(e)}
+                self.wfile.write(json.dumps(error_response).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        # Suppress default logging
+        pass
+
+def main():
+    wizard = GitLabSetupWizard()
+    
+    # Create handler with wizard instance
+    def handler_factory(*args, **kwargs):
+        return WizardHandler(wizard, *args, **kwargs)
+    
+    server = HTTPServer(('0.0.0.0', 8080), handler_factory)
+    
+    print("GitLab Setup Wizard starting...")
+    print("Open your browser to: http://localhost:8080")
+    print("Press Ctrl+C to stop")
+    
+    # Try to open browser automatically
+    try:
+        threading.Timer(1.0, lambda: webbrowser.open('http://localhost:8080')).start()
+    except:
+        pass
+    
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down setup wizard...")
+        server.shutdown()
+
+if __name__ == '__main__':
+    main()

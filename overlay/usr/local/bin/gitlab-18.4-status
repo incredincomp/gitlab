@@ -1,0 +1,255 @@
+#!/bin/bash
+# GitLab 18.4 Upgrade Status and Information Script
+# Shows current version, new features status, and upgrade information
+
+set -euo pipefail
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+print_header() {
+    echo -e "${BLUE}"
+    echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+    echo "║                            GitLab 18.4 Status Report                        ║"
+    echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+check_gitlab_version() {
+    echo -e "${CYAN}📋 GitLab Version Information:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    local version
+    if command -v gitlab-rake >/dev/null 2>&1; then
+        version=$(timeout 30 gitlab-rake gitlab:env:info 2>/dev/null | grep "GitLab information" -A 20 | grep "Version:" | awk '{print $2}' 2>/dev/null || echo "Unable to determine")
+        echo -e "  Current Version: ${GREEN}$version${NC}"
+        
+        if [[ "$version" =~ ^18\.4\. ]]; then
+            echo -e "  Status: ${GREEN}✅ GitLab 18.4.x detected${NC}"
+        elif [[ "$version" =~ ^18\. ]]; then
+            echo -e "  Status: ${YELLOW}⚠️  GitLab 18.x detected (not 18.4)${NC}"
+        else
+            echo -e "  Status: ${RED}❌ Older GitLab version detected${NC}"
+        fi
+    else
+        echo -e "  Status: ${RED}❌ GitLab not installed or not responding${NC}"
+    fi
+    
+    # Check if GitLab is held from upgrades
+    local hold_status
+    hold_status=$(apt-mark showhold | grep gitlab-ce || echo "")
+    if [[ -n "$hold_status" ]]; then
+        echo -e "  Package Status: ${GREEN}✅ Held at specific version (prevents unwanted upgrades)${NC}"
+    else
+        echo -e "  Package Status: ${YELLOW}⚠️  Not held (may upgrade automatically)${NC}"
+    fi
+    
+    echo ""
+}
+
+check_18_4_features() {
+    echo -e "${PURPLE}🚀 GitLab 18.4 Feature Status:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    local config_file="/etc/gitlab/gitlab.rb"
+    
+    if [[ ! -f "$config_file" ]]; then
+        echo -e "  ${RED}❌ GitLab configuration file not found${NC}"
+        return 1
+    fi
+    
+    # Check CI/CD enhancements
+    if grep -q "ci_job_token_push_repository_enabled.*true" "$config_file" 2>/dev/null; then
+        echo -e "  CI/CD Job Token Auth: ${GREEN}✅ Enabled${NC}"
+    else
+        echo -e "  CI/CD Job Token Auth: ${YELLOW}⚠️  Not configured${NC}"
+    fi
+    
+    if grep -q "pipeline_branch_simulation_enabled.*true" "$config_file" 2>/dev/null; then
+        echo -e "  Pipeline Simulation: ${GREEN}✅ Enabled${NC}"
+    else
+        echo -e "  Pipeline Simulation: ${YELLOW}⚠️  Not configured${NC}"
+    fi
+    
+    # Check security enhancements
+    if grep -q "enhanced_artifact_access_controls.*true" "$config_file" 2>/dev/null; then
+        echo -e "  Enhanced Artifact Controls: ${GREEN}✅ Enabled${NC}"
+    else
+        echo -e "  Enhanced Artifact Controls: ${YELLOW}⚠️  Not configured${NC}"
+    fi
+    
+    if grep -q "advanced_sast_performance_improvements.*true" "$config_file" 2>/dev/null; then
+        echo -e "  Advanced SAST Performance: ${GREEN}✅ Enabled${NC}"
+    else
+        echo -e "  Advanced SAST Performance: ${YELLOW}⚠️  Not configured${NC}"
+    fi
+    
+    if grep -q "enhanced_secret_detection.*true" "$config_file" 2>/dev/null; then
+        echo -e "  Enhanced Secret Detection: ${GREEN}✅ Enabled${NC}"
+    else
+        echo -e "  Enhanced Secret Detection: ${YELLOW}⚠️  Not configured${NC}"
+    fi
+    
+    # Check GitLab Duo features (may be commented out)
+    local duo_features=0
+    if grep -q "duo_model_selection_enabled" "$config_file" 2>/dev/null; then
+        ((duo_features++))
+    fi
+    if grep -q "duo_context_exclusion_enabled" "$config_file" 2>/dev/null; then
+        ((duo_features++))
+    fi
+    if grep -q "gitlab_knowledge_graph_enabled" "$config_file" 2>/dev/null; then
+        ((duo_features++))
+    fi
+    
+    if [[ $duo_features -gt 0 ]]; then
+        echo -e "  GitLab Duo Features: ${BLUE}ℹ️  $duo_features features configured (may require license)${NC}"
+    else
+        echo -e "  GitLab Duo Features: ${YELLOW}⚠️  Not configured${NC}"
+    fi
+    
+    echo ""
+}
+
+check_advanced_tools() {
+    echo -e "${GREEN}🛠️  Advanced Tooling Status:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    local tools=(
+        "gitlab-security-scanner:Security Assessment"
+        "gitlab-performance-analyzer:Performance Analysis"
+        "gitlab-setup-wizard:Interactive Setup"
+        "gitlab-health-check:Health Monitoring"
+        "gitlab-metrics:Metrics Collection"
+        "gitlab-18.4-features:18.4 Feature Configuration"
+    )
+    
+    for tool in "${tools[@]}"; do
+        local cmd="${tool%%:*}"
+        local desc="${tool##*:}"
+        
+        if [[ -x "/usr/local/bin/$cmd" ]]; then
+            echo -e "  $desc: ${GREEN}✅ Available (/usr/local/bin/$cmd)${NC}"
+        else
+            echo -e "  $desc: ${RED}❌ Not found${NC}"
+        fi
+    done
+    
+    echo ""
+}
+
+show_new_features() {
+    echo -e "${YELLOW}🌟 GitLab 18.4 Key New Features:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    cat << 'EOF'
+  🤖 GitLab Duo Model Selection (GA)
+     - Choose from multiple AI models for development assistance
+     - End-user model selection for personalized AI experience
+  
+  🧠 GitLab Knowledge Graph
+     - Enhanced code intelligence across your entire codebase
+     - Better context for AI agents and development workflows
+  
+  🔒 Enhanced Security & Performance
+     - Up to 78% faster Advanced SAST scanning
+     - Enhanced vulnerability management with auto-resolve tracking
+     - Improved secret detection with Git fetching optimizations
+  
+  🚀 CI/CD Improvements  
+     - Job tokens can now authenticate Git push requests
+     - Pipeline simulation against different branches
+     - Enhanced artifact access controls
+  
+  📊 Better Project Management
+     - Enhanced parent filtering for issues and epics
+     - Complete epic hierarchies in issue boards
+     - Improved drawer view for work items
+
+EOF
+    
+    echo ""
+}
+
+show_usage_examples() {
+    echo -e "${CYAN}💡 Usage Examples:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    cat << 'EOF'
+  Configure GitLab 18.4 features:
+    sudo gitlab-18.4-features
+  
+  Run comprehensive security assessment:
+    sudo gitlab-security-scanner
+  
+  Analyze performance and get recommendations:
+    sudo gitlab-performance-analyzer
+  
+  Launch interactive setup wizard:
+    sudo gitlab-setup-wizard
+  
+  Check system health:
+    sudo gitlab-health-check
+  
+  View GitLab status:
+    sudo gitlab-ctl status
+
+EOF
+}
+
+check_services() {
+    echo -e "${BLUE}⚙️  GitLab Services Status:${NC}"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    if command -v gitlab-ctl >/dev/null 2>&1; then
+        local services_output
+        services_output=$(gitlab-ctl status 2>/dev/null || echo "Unable to get service status")
+        
+        if [[ "$services_output" == *"run:"* ]]; then
+            local running_count
+            running_count=$(echo "$services_output" | grep -c "run:" || echo "0")
+            echo -e "  Service Status: ${GREEN}✅ $running_count services running${NC}"
+            
+            # Check for any down services
+            local down_services
+            down_services=$(echo "$services_output" | grep "down:" | wc -l || echo "0")
+            if [[ "$down_services" -gt 0 ]]; then
+                echo -e "  Warning: ${YELLOW}⚠️  $down_services services are down${NC}"
+            fi
+        else
+            echo -e "  Service Status: ${RED}❌ Unable to determine service status${NC}"
+        fi
+    else
+        echo -e "  Service Status: ${RED}❌ gitlab-ctl not available${NC}"
+    fi
+    
+    echo ""
+}
+
+print_footer() {
+    echo -e "${BLUE}"
+    echo "╔══════════════════════════════════════════════════════════════════════════════╗"
+    echo "║  For more information: https://about.gitlab.com/releases/2025/09/18/         ║"
+    echo "║  GitLab 18.4 Documentation: https://docs.gitlab.com/                        ║"
+    echo "╚══════════════════════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+main() {
+    print_header
+    check_gitlab_version
+    check_18_4_features
+    check_advanced_tools
+    check_services
+    show_new_features
+    show_usage_examples
+    print_footer
+}
+
+main "$@"

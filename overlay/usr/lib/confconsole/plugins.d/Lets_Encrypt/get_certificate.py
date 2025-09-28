@@ -8,6 +8,10 @@ import sys
 sys.path.append('/usr/lib/inithooks/bin')
 from libinithooks import inithooks_cache
 
+# Import console for user interaction
+from dialog import Dialog
+console = Dialog('TurnKey Linux - Let\'s Encrypt')
+
 LE_INFO_URL = 'https://acme-v02.api.letsencrypt.org/directory'
 
 TITLE = 'Certificate Creation Wizard (GitLab)'
@@ -27,7 +31,8 @@ https://docs.gitlab.com/omnibus/settings/ssl/
 
 example_domain = 'www.example.com'
 
-# XXX Debug paths
+# Configuration paths
+GITLAB_CONFIG_PATH = '/etc/gitlab/gitlab.rb'
 
 
 def load_domain() -> str:
@@ -138,19 +143,39 @@ def run():
         # should be https already - but ensure it
         domain = f"https://{strip_schema(domain)}"
 
-        subprocess.run(["sed", "-i",
-                        f"/^external_url/ s|'.*|'{domain}'|", config])
-        subprocess.run(["sed", "-i",
-                        r"/letsencrypt\['enable'\]/ s|^# *||", config])
-        subprocess.run(["sed", "-i",
-                        r"/^letsencrypt\['enable'\]/ s|=.*|= true|", config])
-        subprocess.run(["sed", "-i",
-                        r"/letsencrypt\['auto_renew'\]/ s|^# *||", config])
-        subprocess.run(["sed", "-i",
-                        r"/^letsencrypt\['auto_renew'\]/ s|=.*|= true|",
-                        config])
-        print('Running gitlab-ctl reconfigure. This might take a while...')
-        exit_code = subprocess.run(['gitlab-ctl', 'reconfigure']).returncode
+        # Update GitLab configuration with domain and SSL settings
+        config = GITLAB_CONFIG_PATH
+        
+        try:
+            # Update external URL
+            result = subprocess.run(["sed", "-i", f"/^external_url/ s|'.*|'{domain}'|", config], 
+                                  check=True, capture_output=True, text=True)
+            
+            # Enable Let's Encrypt
+            subprocess.run(["sed", "-i", r"/letsencrypt\['enable'\]/ s|^# *||", config], check=True)
+            subprocess.run(["sed", "-i", r"/^letsencrypt\['enable'\]/ s|=.*|= true|", config], check=True)
+            
+            # Enable auto-renewal
+            subprocess.run(["sed", "-i", r"/letsencrypt\['auto_renew'\]/ s|^# *||", config], check=True)
+            subprocess.run(["sed", "-i", r"/^letsencrypt\['auto_renew'\]/ s|=.*|= true|", config], check=True)
+            
+            print('Running gitlab-ctl reconfigure. This might take a while...')
+            result = subprocess.run(['gitlab-ctl', 'reconfigure'], 
+                                  capture_output=True, text=True, timeout=600)
+            exit_code = result.returncode
+            
+        except subprocess.CalledProcessError as e:
+            console.msgbox(
+                "Configuration Error!",
+                f"Failed to update GitLab configuration: {e}\n\n"
+                f"Command output: {e.output if hasattr(e, 'output') else 'N/A'}")
+            return
+        except subprocess.TimeoutExpired:
+            console.msgbox(
+                "Timeout Error!",
+                "GitLab reconfiguration timed out. This might indicate a problem "
+                "with the configuration or system resources.")
+            return
 
         if exit_code != 0:
             console.msgbox(

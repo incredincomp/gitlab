@@ -5,9 +5,41 @@
 
 fatal() { echo "$(basename "$0"): FATAL: $*" >&2; exit 1; }
 
+# Function to wait for GitLab services to be fully ready
+wait_for_gitlab_ready() {
+    echo "Waiting for GitLab services to be fully ready..."
+    local max_attempts=60
+    local attempt=0
+    
+    while [ $attempt -lt $max_attempts ]; do
+        if gitlab-ctl status 2>/dev/null | grep -q "run:"; then
+            # Additional check to ensure GitLab Rails is responding
+            if gitlab-rails runner "puts 'GitLab is ready'" 2>/dev/null | grep -q "GitLab is ready"; then
+                echo "GitLab services are ready"
+                return 0
+            fi
+        fi
+        echo "GitLab not ready yet (attempt $((attempt + 1))/$max_attempts), waiting..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    
+    echo "WARNING: GitLab services may not be fully ready, proceeding anyway"
+    return 1
+}
+
 # if GitLab isn't already running, start it
 if ! systemctl is-active --quiet gitlab-runsvdir.service; then
     systemctl start gitlab-runsvdir.service
+fi
+
+# Wait for GitLab to be fully ready before proceeding
+wait_for_gitlab_ready
+
+# Apply environment variable configuration if present
+if [[ -f "/usr/local/bin/gitlab-env-config" ]]; then
+    echo "Applying environment variable configuration..."
+    /usr/local/bin/gitlab-env-config || echo "Warning: Environment configuration failed"
 fi
 
 if [[ -f "$INITHOOKS_CONF" ]]; then
@@ -18,3 +50,15 @@ fi
 
 "$INITHOOKS_PATH/bin/gitlab.py" --pass="$APP_PASS" --email="$APP_EMAIL" --domain="$APP_DOMAIN" \
     || fatal "$INITHOOKS_PATH/bin/gitlab.py failed"
+
+# Configure GitLab 18.4 specific features after initial setup
+echo "Configuring GitLab 18.4 specific features..."
+if [[ -x "/usr/local/bin/gitlab-18.4-features" ]]; then
+    /usr/local/bin/gitlab-18.4-features || echo "Warning: GitLab 18.4 features configuration had issues"
+    
+    # Reconfigure GitLab to apply new settings
+    echo "Applying GitLab 18.4 configuration..."
+    gitlab-ctl reconfigure || echo "Warning: GitLab reconfiguration had issues"
+else
+    echo "Warning: GitLab 18.4 features script not found"
+fi

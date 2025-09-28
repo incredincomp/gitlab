@@ -96,7 +96,8 @@ def main():
                 schema = f"{schema}://"
             domain = f"{schema}{domain}"
         else:
-            domain = f"http://{domain}"
+            # Default to HTTPS for better security
+            domain = f"https://{domain}"
     run(["sed", "-i", f"/^external_url/ s|'.*|'{domain}'|", config])
     run(["sed", "-i",
          fr"/^gitlab_rails\['gitlab_email_from'\]/ s|=.*|= '{email}'|",
@@ -106,14 +107,21 @@ def main():
     print("Setting GitLab 'root' user password. This might take a while.")
     p1 = Popen(["echo", "-e", f"{password}\n{password}\n"], stdout=PIPE)
     p2 = Popen(["gitlab-rake", "gitlab:password:reset[root]"],
-               stdin=p1.stdout, stdout=PIPE)
+               stdin=p1.stdout, stdout=PIPE, stderr=PIPE)
     p1.stdout.close()
+    
+    # Wait for process completion before checking return code
+    output, error = p2.communicate()
+    
     if p2.returncode == 0:
         stream = sys.stdout
+        print(output.decode(), file=stream)
     else:
         stream = sys.stderr
-    output = p2.communicate()[0]
-    print(output.decode(), file=stream)
+        print(f"Error setting GitLab password: {error.decode()}", file=stream)
+        if output:
+            print(f"Output: {output.decode()}", file=stream)
+    
     sys.exit(p2.returncode)
 
 

@@ -1,0 +1,206 @@
+#!/bin/bash
+# GitLab Health Check Script for Container Environments
+# This script provides comprehensive health checks for GitLab services
+
+set -euo pipefail
+
+# Configuration
+GITLAB_CONFIG="/etc/gitlab/gitlab.rb"
+HEALTH_CHECK_TIMEOUT=30
+LOG_FILE="/var/log/gitlab-health-check.log"
+
+# Logging function
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
+}
+
+# Check if GitLab configuration exists
+check_config() {
+    if [[ ! -f "$GITLAB_CONFIG" ]]; then
+        log "ERROR: GitLab configuration file not found: $GITLAB_CONFIG"
+        return 1
+    fi
+    log "INFO: GitLab configuration file exists"
+    return 0
+}
+
+# Check GitLab services status
+check_services() {
+    log "INFO: Checking GitLab services status..."
+    
+    if ! gitlab-ctl status >/dev/null 2>&1; then
+        log "ERROR: GitLab services are not running properly"
+        return 1
+    fi
+    
+    # Check individual critical services
+    critical_services=("postgresql" "redis" "nginx" "unicorn" "sidekiq")
+    
+    for service in "${critical_services[@]}"; do
+        if ! gitlab-ctl status "$service" | grep -q "run:"; then
+            log "ERROR: Critical service '$service' is not running"
+            return 1
+        fi
+    done
+    
+    log "INFO: All critical GitLab services are running"
+    return 0
+}
+
+# Check GitLab web interface
+check_web_interface() {
+    log "INFO: Checking GitLab web interface..."
+    
+    # Get the external URL from config
+    local external_url
+    external_url=$(grep "^external_url" "$GITLAB_CONFIG" | cut -d"'" -f2 2>/dev/null || echo "http://localhost")
+    
+    # Convert to localhost for internal check
+    local check_url
+    check_url=$(echo "$external_url" | sed 's/https\?:\/\/[^\/]*/http:\/\/localhost/')
+    
+    if timeout "$HEALTH_CHECK_TIMEOUT" curl -f -s "$check_url/users/sign_in" >/dev/null 2>&1; then
+        log "INFO: GitLab web interface is accessible"
+        return 0
+    else
+        log "ERROR: GitLab web interface is not accessible at $check_url"
+        return 1
+    fi
+}
+
+# Check database connectivity
+check_database() {
+    log "INFO: Checking database connectivity..."
+    
+    if gitlab-psql -c "SELECT 1;" >/dev/null 2>&1; then
+        log "INFO: Database connectivity is working"
+        return 0
+    else
+        log "ERROR: Database connectivity failed"
+        return 1
+    fi
+}
+
+# Check Redis connectivity
+check_redis() {
+    log "INFO: Checking Redis connectivity..."
+    
+    if gitlab-redis-cli ping | grep -q "PONG"; then
+        log "INFO: Redis connectivity is working"
+        return 0
+    else
+        log "ERROR: Redis connectivity failed"
+        return 1
+    fi
+}
+
+# Check disk space
+check_disk_space() {
+    log "INFO: Checking disk space..."
+    
+    # Check root filesystem
+    local root_usage
+    root_usage=$(df / | awk 'NR==2 {print $5}' | sed 's/%//')
+    
+    if [[ "$root_usage" -gt 90 ]]; then
+        log "WARNING: Root filesystem is $root_usage% full"
+    elif [[ "$root_usage" -gt 95 ]]; then
+        log "ERROR: Root filesystem is critically full ($root_usage%)"
+        return 1
+    else
+        log "INFO: Root filesystem usage is acceptable ($root_usage%)"
+    fi
+    
+    # Check GitLab data directory if different
+    local gitlab_data="/var/opt/gitlab"
+    if [[ -d "$gitlab_data" ]]; then
+        local data_usage
+        data_usage=$(df "$gitlab_data" | awk 'NR==2 {print $5}' | sed 's/%//')
+        
+        if [[ "$data_usage" -gt 90 ]]; then
+            log "WARNING: GitLab data directory is $data_usage% full"
+        elif [[ "$data_usage" -gt 95 ]]; then
+            log "ERROR: GitLab data directory is critically full ($data_usage%)"
+            return 1
+        else
+            log "INFO: GitLab data directory usage is acceptable ($data_usage%)"
+        fi
+    fi
+    
+    return 0
+}
+
+# Check memory usage
+check_memory() {
+    log "INFO: Checking memory usage..."
+    
+    local mem_usage
+    mem_usage=$(free | awk '/^Mem:/ {printf "%.0f", $3/$2 * 100}')
+    
+    if [[ "$mem_usage" -gt 90 ]]; then
+        log "WARNING: Memory usage is high ($mem_usage%)"
+    elif [[ "$mem_usage" -gt 95 ]]; then
+        log "ERROR: Memory usage is critically high ($mem_usage%)"
+        return 1
+    else
+        log "INFO: Memory usage is acceptable ($mem_usage%)"
+    fi
+    
+    return 0
+}
+
+# Main health check function
+main() {
+    local exit_code=0
+    
+    log "INFO: Starting GitLab health check..."
+    
+    # Run all checks
+    check_config || exit_code=1
+    check_services || exit_code=1
+    check_database || exit_code=1
+    check_redis || exit_code=1
+    check_web_interface || exit_code=1
+    check_disk_space || exit_code=1
+    check_memory || exit_code=1
+    
+    if [[ $exit_code -eq 0 ]]; then
+        log "INFO: All health checks passed"
+    else
+        log "ERROR: One or more health checks failed"
+    fi
+    
+    return $exit_code
+}
+
+# Handle script arguments
+case "${1:-check}" in
+    check)
+        main
+        ;;
+    config)
+        check_config
+        ;;
+    services)
+        check_services
+        ;;
+    web)
+        check_web_interface
+        ;;
+    database)
+        check_database
+        ;;
+    redis)
+        check_redis
+        ;;
+    disk)
+        check_disk_space
+        ;;
+    memory)
+        check_memory
+        ;;
+    *)
+        echo "Usage: $0 [check|config|services|web|database|redis|disk|memory]"
+        exit 1
+        ;;
+esac
